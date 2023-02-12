@@ -238,19 +238,24 @@ void ReplicationCoordinatorImpl::ElectionState::_processDryRunResult(
     const auto endResult = _getElectionResult(lk);
     switch (endResult) {
         case VoteRequester::Result::kInsufficientVotes:
+            // INSTRUMENT_BB
             LOGV2(21440, "Not running for primary, we received insufficient votes");
             return;
         case VoteRequester::Result::kStaleTerm:
+            // INSTRUMENT_BB
             LOGV2(21441, "Not running for primary, we have been superseded already");
             return;
         case VoteRequester::Result::kPrimaryRespondedNo:
+            // INSTRUMENT_BB
             LOGV2(21442,
                   "Not running for primary, the current primary responded no in the dry run");
             return;
         case VoteRequester::Result::kCancelled:
+            // INSTRUMENT_BB
             LOGV2(214400, "Not running for primary, election has been cancelled");
             return;
         case VoteRequester::Result::kSuccessfullyElected:
+            // INSTRUMENT_BB
             break;
     }
 

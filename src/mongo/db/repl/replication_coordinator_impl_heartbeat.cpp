@@ -102,6 +102,7 @@ void ReplicationCoordinatorImpl::_doMemberHeartbeat(executor::TaskExecutor::Call
 
     _untrackHeartbeatHandle_inlock(cbData.myHandle);
     if (cbData.status == ErrorCodes::CallbackCanceled) {
+        // INSTRUMENT_BB
         return;
     }
 
@@ -193,6 +194,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     const HostAndPort& target = cbData.request.target;
 
     if (responseStatus == ErrorCodes::CallbackCanceled) {
+        // INSTRUMENT_BB
         LOGV2_FOR_HEARTBEATS(4615619,
                              2,
                              "Received response to heartbeat (requestId: {requestId}) from "
@@ -206,6 +208,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     ReplSetHeartbeatResponse hbResponse;
     BSONObj resp;
     if (responseStatus.isOK()) {
+        // INSTRUMENT_BB
         resp = cbData.response.data;
         responseStatus = hbResponse.initialize(resp, _topCoord->getTerm());
         StatusWith<rpc::ReplSetMetadata> replMetadata =
@@ -311,6 +314,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     if (action.getAction() == HeartbeatResponseAction::NoAction && hbStatusResponse.isOK() &&
         hbStatusResponse.getValue().hasState() &&
         hbStatusResponse.getValue().getState() != MemberState::RS_PRIMARY) {
+        // INSTRUMENT_BB
         if (action.getAdvancedOpTimeOrUpdatedConfig()) {
             // If a member's opTime has moved forward or config is newer, try to update the
             // lastCommitted. Even if we've only updated the config, this is still safe.
@@ -329,6 +333,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     // set.
     if (_getMemberState_inlock().primary() && hbStatusResponse.isOK() &&
         hbStatusResponse.getValue().hasState()) {
+        // INSTRUMENT_BB
         auto remoteState = hbStatusResponse.getValue().getState();
         if (remoteState == MemberState::RS_SECONDARY || remoteState == MemberState::RS_RECOVERING ||
             remoteState == MemberState::RS_ROLLBACK) {
@@ -366,6 +371,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     // in the current term, which implies that the primary has caught up.
     bool catchupTakeoverScheduled = _catchupTakeoverCbh.isValid();
     if (responseStatus.isOK() && catchupTakeoverScheduled && hbResponse.hasAppliedOpTime()) {
+        // INSTRUMENT_BB
         const auto& hbLastAppliedOpTime = hbResponse.getAppliedOpTime();
         if (hbLastAppliedOpTime.getTerm() == _topCoord->getTerm()) {
             _cancelCatchupTakeover_inlock();
@@ -386,6 +392,7 @@ stdx::unique_lock<Latch> ReplicationCoordinatorImpl::_handleHeartbeatResponseAct
     switch (action.getAction()) {
         case HeartbeatResponseAction::NoAction:
             // Update the cached member state if different than the current topology member state
+            // INSTRUMENT_BB
             if (_memberState != _topCoord->getMemberState()) {
                 const PostMemberStateUpdateAction postUpdateAction =
                     _updateMemberStateFromTopologyCoordinator(lock);
@@ -395,13 +402,16 @@ stdx::unique_lock<Latch> ReplicationCoordinatorImpl::_handleHeartbeatResponseAct
             }
             break;
         case HeartbeatResponseAction::Reconfig:
+            // INSTRUMENT_BB
             invariant(responseStatus.isOK());
             _scheduleHeartbeatReconfig(lock, responseStatus.getValue().getConfig());
             break;
         case HeartbeatResponseAction::RetryReconfig:
+            // INSTRUMENT_BB
             _scheduleHeartbeatReconfig(lock, _rsConfig);
             break;
         case HeartbeatResponseAction::StepDownSelf:
+            // INSTRUMENT_BB
             invariant(action.getPrimaryConfigIndex() == _selfIndex);
             if (_topCoord->prepareForUnconditionalStepDown()) {
                 LOGV2(21475, "Stepping down from primary in response to heartbeat");
@@ -415,6 +425,7 @@ stdx::unique_lock<Latch> ReplicationCoordinatorImpl::_handleHeartbeatResponseAct
             break;
         case HeartbeatResponseAction::PriorityTakeover: {
             // Don't schedule a priority takeover if any takeover is already scheduled.
+            // INSTRUMENT_BB
             if (!_priorityTakeoverCbh.isValid() && !_catchupTakeoverCbh.isValid()) {
 
                 // Add randomized offset to calculated priority takeover delay.
@@ -435,6 +446,7 @@ stdx::unique_lock<Latch> ReplicationCoordinatorImpl::_handleHeartbeatResponseAct
         }
         case HeartbeatResponseAction::CatchupTakeover: {
             // Don't schedule a catchup takeover if any takeover is already scheduled.
+            // INSTRUMENT_BB
             if (!_catchupTakeoverCbh.isValid() && !_priorityTakeoverCbh.isValid()) {
                 Milliseconds catchupTakeoverDelay = _rsConfig.getCatchUpTakeoverDelay();
                 _catchupTakeoverWhen = _replExecutor->now() + catchupTakeoverDelay;
@@ -458,6 +470,7 @@ namespace {
 /**
  * This callback is purely for logging and has no effect on any other operations
  */
+// INSTRUMENT_FUNC
 void remoteStepdownCallback(const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {
     const Status status = cbData.response.status;
     if (status == ErrorCodes::CallbackCanceled) {

@@ -414,17 +414,20 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
 
         switch (oplogEntry.getCommandType()) {
             case OplogEntry::CommandType::kRenameCollection: {
+                // INSTRUMENT_BB
                 // Add both the 'from' and 'to' namespaces.
                 namespaces.insert(NamespaceString(firstElem.valueStringDataSafe()));
                 namespaces.insert(NamespaceString(obj.getStringField("to")));
                 break;
             }
             case OplogEntry::CommandType::kDropDatabase: {
+                // INSTRUMENT_BB
                 // There is no specific namespace to save for a drop database operation.
                 break;
             }
             case OplogEntry::CommandType::kDbCheck:
             case OplogEntry::CommandType::kEmptyCapped: {
+                // INSTRUMENT_BB
                 // These commands do not need to be supported by rollback. 'convertToCapped' should
                 // always be converted to lower level DDL operations, and 'emptycapped' is a
                 // testing-only command.
@@ -442,6 +445,7 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
             case OplogEntry::CommandType::kAbortIndexBuild:
             case OplogEntry::CommandType::kCommitIndexBuild:
             case OplogEntry::CommandType::kCollMod: {
+                // INSTRUMENT_BB
                 // For all other command types, we should be able to parse the collection name from
                 // the first command argument.
                 try {
