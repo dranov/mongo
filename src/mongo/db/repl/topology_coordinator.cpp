@@ -2591,7 +2591,7 @@ MemberState TopologyCoordinator::getMemberState() const {
             // INSTRUMENT_BB
             return MemberState::RS_REMOVED;
         }
-        // INSTRUMENT_BB
+
         return MemberState::RS_STARTUP;
     }
 
