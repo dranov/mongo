@@ -3023,6 +3023,7 @@ int TopologyCoordinator::getMaintenanceCount() const {
 
 TopologyCoordinator::UpdateTermResult TopologyCoordinator::updateTerm(long long term, Date_t now) {
     if (term <= _term) {
+        // INSTRUMENT_BB
         return TopologyCoordinator::UpdateTermResult::kAlreadyUpToDate;
     }
     // Don't run election if we just stood up or learned about a new term.
