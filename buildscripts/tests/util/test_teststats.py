@@ -21,6 +21,60 @@ class NormalizeTestNameTest(unittest.TestCase):
                          under_test.normalize_test_name("\\home\\user\\test.js"))
 
 
+class TestHistoricTestInfo(unittest.TestCase):
+    def test_total_test_runtime_not_passing_test_no_hooks(self):
+        test_info = under_test.HistoricTestInfo(
+            test_name='jstests/test.js',
+            num_pass=0,
+            avg_duration=0.0,
+            hooks=[],
+        )
+
+        self.assertEqual(0.0, test_info.total_test_runtime())
+
+    def test_total_test_runtime_not_passing_test_with_hooks(self):
+        test_info = under_test.HistoricTestInfo(
+            test_name='jstests/test.js',
+            num_pass=0,
+            avg_duration=0.0,
+            hooks=[
+                under_test.HistoricHookInfo(
+                    hook_id='test:hook',
+                    num_pass=10,
+                    avg_duration=5.0,
+                ),
+            ],
+        )
+
+        self.assertEqual(0.0, test_info.total_test_runtime())
+
+    def test_total_test_runtime_passing_test_no_hooks(self):
+        test_info = under_test.HistoricTestInfo(
+            test_name='jstests/test.js',
+            num_pass=10,
+            avg_duration=23.0,
+            hooks=[],
+        )
+
+        self.assertEqual(23.0, test_info.total_test_runtime())
+
+    def test_total_test_runtime_passing_test_with_hooks(self):
+        test_info = under_test.HistoricTestInfo(
+            test_name='jstests/test.js',
+            num_pass=10,
+            avg_duration=23.0,
+            hooks=[
+                under_test.HistoricHookInfo(
+                    hook_id='test:hook',
+                    num_pass=10,
+                    avg_duration=5.0,
+                ),
+            ],
+        )
+
+        self.assertEqual(28.0, test_info.total_test_runtime())
+
+
 class TestHistoricTaskData(unittest.TestCase):
     def test_no_hooks(self):
         evg_results = [
@@ -80,7 +134,7 @@ class TestHistoricTaskData(unittest.TestCase):
     @staticmethod
     def _make_evg_result(test_file="dir/test1.js", num_pass=0, duration=0):
         return Mock(
-            test_file=test_file,
+            test_name=test_file,
             task_name="task1",
             variant="variant1",
             distro="distro1",

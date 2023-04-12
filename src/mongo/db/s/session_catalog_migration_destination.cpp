@@ -39,7 +39,7 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/ops/write_ops_retryability.h"
 #include "mongo/db/repl/oplog.h"
@@ -57,6 +57,8 @@
 
 namespace mongo {
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(interruptBeforeProcessingPrePostImageOriginatingOp);
 
 const auto kOplogField = "oplog";
 const WriteConcernOptions kMajorityWC(WriteConcernOptions::kMajority,
@@ -491,10 +493,24 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
                 lastOpTimeWaited = lastResult.oplogTime;
             }
         }
+
         for (BSONArrayIteratorSorted oplogIter(oplogArray); oplogIter.more();) {
+            auto oplogEntry = oplogIter.next().Obj();
+            interruptBeforeProcessingPrePostImageOriginatingOp.executeIf(
+                [&](const auto&) {
+                    uasserted(6749200,
+                              "Intentionally failing session migration before processing post/pre "
+                              "image originating update oplog entry");
+                },
+                // SERVER-68728 The latter two conditions are needed if the donor shard is v5.0 in
+                // multi-version clusters
+                [&](const auto&) {
+                    return !oplogEntry["needsRetryImage"].eoo() ||
+                        !oplogEntry["preImageOpTime"].eoo() || !oplogEntry["postImageOpTime"].eoo();
+                });
             try {
-                lastResult = processSessionOplog(
-                    oplogIter.next().Obj(), lastResult, service, _cancellationToken);
+                lastResult =
+                    processSessionOplog(oplogEntry, lastResult, service, _cancellationToken);
             } catch (const ExceptionFor<ErrorCodes::TransactionTooOld>&) {
                 // This means that the server has a newer txnNumber than the oplog being
                 // migrated, so just skip it

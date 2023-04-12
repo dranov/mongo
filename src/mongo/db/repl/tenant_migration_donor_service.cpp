@@ -36,7 +36,7 @@
 #include "mongo/config.h"
 #include "mongo/db/commands/tenant_migration_donor_cmds_gen.h"
 #include "mongo/db/commands/tenant_migration_recipient_cmds_gen.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index_builds_coordinator.h"
@@ -77,6 +77,7 @@ MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationBeforeInsertingDonorStateDoc);
 MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationBeforeCreatingStateDocumentTTLIndex);
 MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationBeforeCreatingExternalKeysTTLIndex);
 MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationBeforeLeavingCommittedState);
+MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationAfterUpdatingToCommittedState);
 
 const std::string kTTLIndexName = "TenantMigrationDonorTTLIndex";
 const std::string kExternalKeysTTLIndexName = "ExternalKeysTTLIndex";
@@ -617,6 +618,10 @@ ExecutorFuture<repl::OpTime> TenantMigrationDonorService::Instance::_updateState
 
                        wuow.commit();
 
+                       if (nextState == TenantMigrationDonorStateEnum::kCommitted) {
+                           pauseTenantMigrationAfterUpdatingToCommittedState.pauseWhileSet();
+                       }
+
                        updateOpTime = oplogSlot;
                    });
 
@@ -932,13 +937,13 @@ SemiFuture<void> TenantMigrationDonorService::Instance::run(
             return _waitForRecipientToBecomeConsistentAndEnterBlockingState(
                 executor, recipientTargeterRS, abortToken);
         })
-        .then([this, self = shared_from_this(), executor, recipientTargeterRS, abortToken] {
+        .then([this, self = shared_from_this(), executor, recipientTargeterRS, abortToken, token] {
             LOGV2(6104905,
                   "Waiting for recipient to reach the block timestamp.",
                   "migrationId"_attr = _migrationUuid,
                   "tenantId"_attr = _tenantId);
             return _waitForRecipientToReachBlockTimestampAndEnterCommittedState(
-                executor, recipientTargeterRS, abortToken);
+                executor, recipientTargeterRS, abortToken, token);
         })
         // Note from here on the migration cannot be aborted, so only the token from the primary
         // only service should be used.
@@ -1219,6 +1224,7 @@ ExecutorFuture<void>
 TenantMigrationDonorService::Instance::_waitForRecipientToReachBlockTimestampAndEnterCommittedState(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
     std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
+    const CancellationToken& abortToken,
     const CancellationToken& token) {
     {
         stdx::lock_guard<Latch> lg(_mutex);
@@ -1228,7 +1234,6 @@ TenantMigrationDonorService::Instance::_waitForRecipientToReachBlockTimestampAnd
 
         invariant(_stateDoc.getBlockTimestamp());
     }
-
     // Source to cancel the timeout if the operation completed in time.
     CancellationSource cancelTimeoutSource;
     CancellationSource recipientSyncDataSource(token);
@@ -1284,18 +1289,21 @@ TenantMigrationDonorService::Instance::_waitForRecipientToReachBlockTimestampAnd
                 uasserted(ErrorCodes::InternalError, "simulate a tenant migration error");
             }
         })
-        .then([this, self = shared_from_this(), executor, token] {
+        .then([this, self = shared_from_this(), executor, abortToken, token] {
+            // Last chance to abort
+            checkForTokenInterrupt(abortToken);
+
             // Enter "commit" state.
             LOGV2(6104908,
                   "Entering 'committed' state.",
                   "migrationId"_attr = _migrationUuid,
                   "tenantId"_attr = _tenantId);
+            // Ignore the abort token once we've entered the committed state
             return _updateStateDoc(executor, TenantMigrationDonorStateEnum::kCommitted, token)
                 .then([this, self = shared_from_this(), executor, token](repl::OpTime opTime) {
                     return _waitForMajorityWriteConcern(executor, std::move(opTime), token)
                         .then([this, self = shared_from_this()] {
                             pauseTenantMigrationBeforeLeavingCommittedState.pauseWhileSet();
-
                             stdx::lock_guard<Latch> lg(_mutex);
                             // If interrupt is called at some point during execution, it is
                             // possible that interrupt() will fulfill the promise before we

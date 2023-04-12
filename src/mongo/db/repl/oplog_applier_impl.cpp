@@ -38,7 +38,6 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/apply_ops.h"
@@ -147,6 +146,9 @@ protected:
         // We have to use setMyLastAppliedOpTimeAndWallTimeForward since this thread races with
         // ReplicationExternalStateImpl::onTransitionToPrimary.
         _replCoord->setMyLastAppliedOpTimeAndWallTimeForward(newOpTimeAndWallTime);
+        // We know we're at a no-holes point and we've already advanced visibility; we need
+        // to notify waiters since we changed the lastAppliedSnapshot.
+        signalOplogWaiters();
     }
 
     void _recordDurable(const OpTimeAndWallTime& newOpTimeAndWallTime) {

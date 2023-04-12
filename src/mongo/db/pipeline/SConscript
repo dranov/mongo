@@ -165,6 +165,7 @@ env.Library(
         'accumulator_rank.cpp',
         'accumulator_std_dev.cpp',
         'accumulator_sum.cpp',
+        'map_reduce_options.idl',
         'window_function/window_bounds.cpp',
         'window_function/window_function_covariance.cpp',
         'window_function/window_function_count.cpp',
@@ -183,8 +184,9 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/exec/sort_executor',
-        '$BUILD_DIR/mongo/db/index/key_generator'
-    ]
+        '$BUILD_DIR/mongo/db/index/index_access_method',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
 )
 
 env.Library(
@@ -288,6 +290,7 @@ pipelineEnv.Library(
         'document_source_graph_lookup.cpp',
         'document_source_group.cpp',
         'document_source_index_stats.cpp',
+        'document_source_internal_all_collection_stats.cpp',
         'document_source_internal_compute_geo_near_distance.cpp',
         'document_source_internal_convert_bucket_index_stats.cpp',
         'document_source_internal_inhibit_optimization.cpp',
@@ -314,6 +317,7 @@ pipelineEnv.Library(
         'document_source_sequential_document_cache.cpp',
         'document_source_set_variable_from_subpipeline.cpp',
         'document_source_set_window_fields.cpp',
+        'document_source_sharded_data_distribution.cpp',
         'document_source_single_document_transformation.cpp',
         'document_source_skip.cpp',
         'document_source_sort.cpp',
@@ -349,7 +353,7 @@ pipelineEnv.Library(
         '$BUILD_DIR/mongo/db/exec/scoped_timer',
         '$BUILD_DIR/mongo/db/exec/sort_executor',
         '$BUILD_DIR/mongo/db/generic_cursor',
-        '$BUILD_DIR/mongo/db/index/key_generator',
+        '$BUILD_DIR/mongo/db/index/index_access_method',
         '$BUILD_DIR/mongo/db/logical_session_cache',
         '$BUILD_DIR/mongo/db/logical_session_id_helpers',
         '$BUILD_DIR/mongo/db/matcher/expressions',
@@ -391,6 +395,7 @@ pipelineEnv.Library(
         '$BUILD_DIR/mongo/db/query/projection_ast',
         '$BUILD_DIR/mongo/db/repl/image_collection_entry',
         '$BUILD_DIR/mongo/db/sorter/sorter_idl',
+        '$BUILD_DIR/mongo/db/sorter/sorter_stats',
         '$BUILD_DIR/mongo/db/timeseries/timeseries_conversion_util',
         '$BUILD_DIR/mongo/db/timeseries/timeseries_options',
         '$BUILD_DIR/mongo/rpc/command_status',
@@ -461,6 +466,7 @@ env.Library(
         'document_source_coll_stats.idl',
         'document_source_densify.idl',
         'document_source_fill.idl',
+        'document_source_internal_all_collection_stats.idl',
         'document_source_internal_apply_oplog_update.idl',
         'document_source_list_sessions.idl',
         'document_source_merge.idl',
@@ -493,6 +499,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/change_stream_options_manager',
+        '$BUILD_DIR/mongo/db/concurrency/exception_util',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/query_exec',
         '$BUILD_DIR/mongo/db/record_id_helpers',

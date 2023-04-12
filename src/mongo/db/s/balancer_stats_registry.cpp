@@ -31,6 +31,7 @@
 
 #include "mongo/db/s/balancer_stats_registry.h"
 
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -114,9 +115,12 @@ void BalancerStatsRegistry::initializeAsync(OperationContext* opCtx) {
 
             LOGV2_DEBUG(6419601, 2, "Initializing BalancerStatsRegistry");
             try {
-                // Lock the range deleter to prevent
-                // concurrent modifications of orphans count
-                ScopedRangeDeleterLock rangeDeleterLock(opCtx);
+                // Lock the range deleter to prevent concurrent modifications of orphans count
+                ScopedRangeDeleterLock rangeDeleterLock(opCtx, LockMode::MODE_S);
+                // The collection lock is needed to serialize with direct writes to
+                // config.rangeDeletions
+                AutoGetCollection rangeDeletionLock(
+                    opCtx, NamespaceString::kRangeDeletionNamespace, MODE_S);
                 // Load current ophans count from disk
                 _loadOrphansCount(opCtx);
                 LOGV2_DEBUG(6419602, 2, "Completed BalancerStatsRegistry initialization");
@@ -175,6 +179,41 @@ long long BalancerStatsRegistry::getCollNumOrphanDocs(const UUID& collectionUUID
     }
     return 0;
 }
+
+long long BalancerStatsRegistry::getCollNumOrphanDocsFromDiskIfNeeded(
+    OperationContext* opCtx, const UUID& collectionUUID) const {
+    try {
+        return getCollNumOrphanDocs(collectionUUID);
+    } catch (const ExceptionFor<ErrorCodes::NotYetInitialized>&) {
+        // Since the registry is not initialized, run an aggregation to get the number of orphans
+        DBDirectClient client(opCtx);
+        std::vector<BSONObj> pipeline;
+        pipeline.push_back(
+            BSON("$match" << BSON(RangeDeletionTask::kCollectionUuidFieldName << collectionUUID)));
+        pipeline.push_back(
+            BSON("$group" << BSON("_id"
+                                  << "numOrphans"
+                                  << "count"
+                                  << BSON("$sum"
+                                          << "$" + RangeDeletionTask::kNumOrphanDocsFieldName))));
+        AggregateCommandRequest aggRequest(NamespaceString::kRangeDeletionNamespace, pipeline);
+        auto swCursor = DBClientCursor::fromAggregationRequest(
+            &client, aggRequest, false /* secondaryOk */, true /* useExhaust */);
+        if (!swCursor.isOK()) {
+            return 0;
+        }
+        auto cursor = std::move(swCursor.getValue());
+        if (!cursor->more()) {
+            return 0;
+        }
+        auto res = cursor->nextSafe();
+        invariant(!cursor->more());
+        auto numOrphans = res.getField("count");
+        invariant(numOrphans);
+        return numOrphans.exactNumberLong();
+    }
+}
+
 
 void BalancerStatsRegistry::onRangeDeletionTaskInsertion(const UUID& collectionUUID,
                                                          long long numOrphanDocs) {

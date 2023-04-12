@@ -104,7 +104,9 @@ public:
                          const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : DocumentSource(stageName, expCtx),
           _outputNs(std::move(outputNs)),
-          _writeConcern(expCtx->opCtx->getWriteConcern()) {}
+          _writeConcern(expCtx->opCtx->getWriteConcern()),
+          _writeSizeEstimator(
+              expCtx->mongoProcessInterface->getWriteSizeEstimator(expCtx->opCtx, outputNs)) {}
 
     DepsTracker::State getDependencies(DepsTracker* deps) const override {
         deps->needWholeDocument = true;
@@ -114,7 +116,7 @@ public:
     GetModPathsReturn getModifiedPaths() const override {
         // For purposes of tracking which fields come from where, the writer stage does not modify
         // any fields by default.
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {}};
     }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() override {
@@ -122,7 +124,7 @@ public:
     }
 
     bool canRunInParallelBeforeWriteStage(
-        const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const override {
+        const OrderedPathSet& nameOfShardKeyFieldsUponEntryToStage) const override {
         return true;
     }
 
@@ -168,6 +170,9 @@ protected:
     // context. The getMore's will not have an attached writeConcern however we still want to
     // respect the writeConcern of the original command.
     WriteConcernOptions _writeConcern;
+
+    // An interface that is used to estimate the size of each write operation.
+    const std::unique_ptr<MongoProcessInterface::WriteSizeEstimator> _writeSizeEstimator;
 
 private:
     bool _initialized{false};

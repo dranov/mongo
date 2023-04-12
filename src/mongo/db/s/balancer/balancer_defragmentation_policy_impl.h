@@ -53,7 +53,7 @@ public:
         OperationContext* opCtx) = 0;
 
     virtual boost::optional<MigrateInfo> popNextMigration(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) = 0;
+        OperationContext* opCtx, stdx::unordered_set<ShardId>* availableShards) = 0;
 
     virtual void applyActionResult(OperationContext* opCtx,
                                    const DefragmentationAction& action,
@@ -64,6 +64,9 @@ public:
     virtual bool isComplete() const = 0;
 
     virtual void userAbort() = 0;
+
+protected:
+    static constexpr uint64_t kSmallChunkSizeThresholdPctg = 25;
 };
 
 class BalancerDefragmentationPolicyImpl : public BalancerDefragmentationPolicy {
@@ -85,7 +88,7 @@ public:
     virtual BSONObj reportProgressOn(const UUID& uuid) override;
 
     MigrateInfoVector selectChunksToMove(OperationContext* opCtx,
-                                         stdx::unordered_set<ShardId>* usedShards) override;
+                                         stdx::unordered_set<ShardId>* availableShards) override;
 
     StringData getName() const override;
 
@@ -95,8 +98,7 @@ public:
                            const DefragmentationAction& action,
                            const DefragmentationActionResponse& response) override;
 
-    void startCollectionDefragmentation(OperationContext* opCtx,
-                                        const CollectionType& coll) override;
+    void startCollectionDefragmentations(OperationContext* opCtx) override;
 
     void abortCollectionDefragmentation(OperationContext* opCtx,
                                         const NamespaceString& nss) override;

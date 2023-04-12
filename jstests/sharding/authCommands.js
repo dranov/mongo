@@ -88,12 +88,8 @@ st.startBalancer();
 // Make sure we've done at least some splitting, so the balancer will work
 assert.gt(findChunksUtil.findChunksByNs(configDB, 'test.foo').count(), 2);
 
-// Make sure we eventually balance all the chunks we've created
-assert.soon(function() {
-    var x = st.chunkDiff("foo", "test");
-    print("chunk diff: " + x);
-    return x < 2 && configDB.locks.findOne({_id: 'test.foo'}).state == 0;
-}, "no balance happened", 15 * 60 * 1000);
+// Make sure we eventually balance the 'test.foo' collection
+st.awaitBalance('foo', 'test', 60 * 5 * 1000);
 
 var map = function() {
     emit(this.i, this.j);

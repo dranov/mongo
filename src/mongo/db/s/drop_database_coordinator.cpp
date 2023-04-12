@@ -39,6 +39,7 @@
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_database.h"
+#include "mongo/db/vector_clock_mutable.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/client/shard_registry.h"
@@ -133,13 +134,13 @@ void DropDatabaseCoordinator::_dropShardedCollection(
     participants.erase(std::remove(participants.begin(), participants.end(), primaryShardId),
                        participants.end());
     sharding_ddl_util::sendDropCollectionParticipantCommandToShards(
-        opCtx, nss, participants, **executor, getCurrentSession(_doc));
+        opCtx, nss, participants, **executor, getCurrentSession(_doc), false /* fromMigrate */);
 
     // The sharded collection must be dropped on the primary shard after it has been dropped on all
     // of the other shards to ensure it can only be re-created as unsharded with a higher optime
     // than all of the drops.
     sharding_ddl_util::sendDropCollectionParticipantCommandToShards(
-        opCtx, nss, {primaryShardId}, **executor, getCurrentSession(_doc));
+        opCtx, nss, {primaryShardId}, **executor, getCurrentSession(_doc), false /* fromMigrate */);
 }
 
 DropDatabaseCoordinator::DropDatabaseCoordinator(ShardingDDLCoordinatorService* service,
@@ -258,9 +259,11 @@ ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
                         const auto db = catalogClient->getDatabase(
                             opCtx, _dbName, repl::ReadConcernLevel::kMajorityReadConcern);
                         if (_doc.getDatabaseVersion()->getUuid() != db.getVersion().getUuid()) {
+                            VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
                             return;  // skip to FlushDatabaseCacheUpdates
                         }
                     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+                        VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
                         return;  // skip to FlushDatabaseCacheUpdates
                     }
                 }
@@ -347,6 +350,8 @@ ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
 
                     removeDatabaseMetadataFromConfig(
                         opCtx, _dbName, *metadata().getDatabaseVersion());
+
+                    VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
                 }
             }))
         .then([this, executor = executor, anchor = shared_from_this()] {

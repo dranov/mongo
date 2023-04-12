@@ -38,7 +38,7 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_repair.h"
 #include "mongo/db/catalog/validate_gen.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -106,7 +106,7 @@ IndexConsistency::IndexConsistency(OperationContext* opCtx,
 
 void IndexConsistency::addMultikeyMetadataPath(const KeyString::Value& ks, IndexInfo* indexInfo) {
     auto hash = _hashKeyString(ks, indexInfo->indexNameHash);
-    if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
+    if (MONGO_unlikely(_validateState->logDiagnostics())) {
         LOGV2(6208500,
               "[validate](multikeyMetadataPath) Adding with the hash",
               "hash"_attr = hash,
@@ -118,7 +118,7 @@ void IndexConsistency::addMultikeyMetadataPath(const KeyString::Value& ks, Index
 void IndexConsistency::removeMultikeyMetadataPath(const KeyString::Value& ks,
                                                   IndexInfo* indexInfo) {
     auto hash = _hashKeyString(ks, indexInfo->indexNameHash);
-    if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
+    if (MONGO_unlikely(_validateState->logDiagnostics())) {
         LOGV2(6208501,
               "[validate](multikeyMetadataPath) Removing with the hash",
               "hash"_attr = hash,
@@ -132,9 +132,26 @@ size_t IndexConsistency::getMultikeyMetadataPathCount(IndexInfo* indexInfo) {
 }
 
 bool IndexConsistency::haveEntryMismatch() const {
-    return std::any_of(_indexKeyBuckets.begin(),
-                       _indexKeyBuckets.end(),
-                       [](const IndexKeyBucket& bucket) -> bool { return bucket.indexKeyCount; });
+    bool haveMismatch =
+        std::any_of(_indexKeyBuckets.begin(),
+                    _indexKeyBuckets.end(),
+                    [](const IndexKeyBucket& bucket) -> bool { return bucket.indexKeyCount; });
+
+    if (haveMismatch && _validateState->logDiagnostics()) {
+        for (size_t i = 0; i < _indexKeyBuckets.size(); i++) {
+            if (_indexKeyBuckets[i].indexKeyCount == 0) {
+                continue;
+            }
+
+            LOGV2(7404500,
+                  "[validate](bucket entry mismatch)",
+                  "hash"_attr = i,
+                  "indexKeyCount"_attr = _indexKeyBuckets[i].indexKeyCount,
+                  "bucketBytesSize"_attr = _indexKeyBuckets[i].bucketSizeBytes);
+        }
+    }
+
+    return haveMismatch;
 }
 
 void IndexConsistency::setSecondPhase() {
@@ -192,7 +209,7 @@ void IndexConsistency::repairMissingIndexEntries(OperationContext* opCtx,
     }
 }
 
-void IndexConsistency::addIndexEntryErrors(ValidateResults* results) {
+void IndexConsistency::addIndexEntryErrors(OperationContext* opCtx, ValidateResults* results) {
     invariant(!_firstPhase);
 
     // We'll report up to 1MB for extra index entry errors and missing index entry errors.
@@ -206,11 +223,26 @@ void IndexConsistency::addIndexEntryErrors(ValidateResults* results) {
         numExtraIndexEntryErrors += item.second.size();
     }
 
+    // Sort missing index entries by size so we can process in order of increasing size and return
+    // as many as possible within memory limits.
+    using MissingIt = decltype(_missingIndexEntries)::const_iterator;
+    std::vector<MissingIt> missingIndexEntriesBySize;
+    missingIndexEntriesBySize.reserve(_missingIndexEntries.size());
+    for (auto it = _missingIndexEntries.begin(); it != _missingIndexEntries.end(); ++it) {
+        missingIndexEntriesBySize.push_back(it);
+    }
+    std::sort(missingIndexEntriesBySize.begin(),
+              missingIndexEntriesBySize.end(),
+              [](const MissingIt& a, const MissingIt& b) {
+                  return a->second.keyString.getSize() < b->second.keyString.getSize();
+              });
+
     // Inform which indexes have inconsistencies and add the BSON objects of the inconsistent index
     // entries to the results vector.
     bool missingIndexEntrySizeLimitWarning = false;
-    for (const auto& missingIndexEntry : _missingIndexEntries) {
-        const IndexEntryInfo& entryInfo = missingIndexEntry.second;
+    bool first = true;
+    for (const auto& missingIndexEntry : missingIndexEntriesBySize) {
+        const IndexEntryInfo& entryInfo = missingIndexEntry->second;
         KeyString::Value ks = entryInfo.keyString;
         auto indexKey =
             KeyString::toBsonSafe(ks.getBuffer(), ks.getSize(), entryInfo.ord, ks.getTypeBits());
@@ -221,8 +253,9 @@ void IndexConsistency::addIndexEntryErrors(ValidateResults* results) {
                                             entryInfo.idKey);
 
         numMissingIndexEntriesSizeBytes += entry.objsize();
-        if (numMissingIndexEntriesSizeBytes <= kErrorSizeBytes) {
+        if (first || numMissingIndexEntriesSizeBytes <= kErrorSizeBytes) {
             results->missingIndexEntries.push_back(entry);
+            first = false;
         } else if (!missingIndexEntrySizeLimitWarning) {
             StringBuilder ss;
             ss << "Not all missing index entry inconsistencies are listed due to size limitations.";
@@ -230,6 +263,8 @@ void IndexConsistency::addIndexEntryErrors(ValidateResults* results) {
 
             missingIndexEntrySizeLimitWarning = true;
         }
+
+        _printMetadata(opCtx, results, entryInfo);
 
         std::string indexName = entry["indexName"].String();
         if (!results->indexResultsMap.at(indexName).valid) {
@@ -243,33 +278,58 @@ void IndexConsistency::addIndexEntryErrors(ValidateResults* results) {
         results->indexResultsMap.at(indexName).valid = false;
     }
 
-    bool extraIndexEntrySizeLimitWarning = false;
+    // Sort extra index entries by size so we can process in order of increasing size and return as
+    // many as possible within memory limits.
+    using ExtraIt = SimpleBSONObjSet::const_iterator;
+    std::vector<ExtraIt> extraIndexEntriesBySize;
+    // Since the extra entries are stored in a map of sets, we have to iterate the entries in the
+    // map and sum the size of the sets in order to get the total number. Given that we can have at
+    // most 64 indexes per collection, and the total number of entries could potentially be in the
+    // millions, we expect that iterating the map will be much less costly than the additional
+    // allocations and copies that could result from not calling 'reserve' on the vector.
+    size_t totalExtraIndexEntriesCount =
+        std::accumulate(_extraIndexEntries.begin(),
+                        _extraIndexEntries.end(),
+                        0,
+                        [](size_t total, const std::pair<IndexKey, SimpleBSONObjSet>& set) {
+                            return total + set.second.size();
+                        });
+    extraIndexEntriesBySize.reserve(totalExtraIndexEntriesCount);
     for (const auto& extraIndexEntry : _extraIndexEntries) {
         const SimpleBSONObjSet& entries = extraIndexEntry.second;
-        for (const auto& entry : entries) {
-            numExtraIndexEntriesSizeBytes += entry.objsize();
-            if (numExtraIndexEntriesSizeBytes <= kErrorSizeBytes) {
-                results->extraIndexEntries.push_back(entry);
-            } else if (!extraIndexEntrySizeLimitWarning) {
-                StringBuilder ss;
-                ss << "Not all extra index entry inconsistencies are listed due to size "
-                      "limitations.";
-                results->errors.push_back(ss.str());
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            extraIndexEntriesBySize.push_back(it);
+        }
+    }
+    std::sort(extraIndexEntriesBySize.begin(),
+              extraIndexEntriesBySize.end(),
+              [](const ExtraIt& a, const ExtraIt& b) { return a->objsize() < b->objsize(); });
 
-                extraIndexEntrySizeLimitWarning = true;
-            }
-
-            std::string indexName = entry["indexName"].String();
-            if (!results->indexResultsMap.at(indexName).valid) {
-                continue;
-            }
-
+    bool extraIndexEntrySizeLimitWarning = false;
+    for (const auto& entry : extraIndexEntriesBySize) {
+        numExtraIndexEntriesSizeBytes += entry->objsize();
+        if (first || numExtraIndexEntriesSizeBytes <= kErrorSizeBytes) {
+            results->extraIndexEntries.push_back(*entry);
+            first = false;
+        } else if (!extraIndexEntrySizeLimitWarning) {
             StringBuilder ss;
-            ss << "Index with name '" << indexName << "' has inconsistencies.";
+            ss << "Not all extra index entry inconsistencies are listed due to size "
+                  "limitations.";
             results->errors.push_back(ss.str());
 
-            results->indexResultsMap.at(indexName).valid = false;
+            extraIndexEntrySizeLimitWarning = true;
         }
+
+        std::string indexName = (*entry)["indexName"].String();
+        if (!results->indexResultsMap.at(indexName).valid) {
+            continue;
+        }
+
+        StringBuilder ss;
+        ss << "Index with name '" << indexName << "' has inconsistencies.";
+        results->errors.push_back(ss.str());
+
+        results->indexResultsMap.at(indexName).valid = false;
     }
 
     // Inform how many inconsistencies were detected.
@@ -302,7 +362,8 @@ void IndexConsistency::addDocumentMultikeyPaths(IndexInfo* indexInfo,
 void IndexConsistency::addDocKey(OperationContext* opCtx,
                                  const KeyString::Value& ks,
                                  IndexInfo* indexInfo,
-                                 RecordId recordId) {
+                                 RecordId recordId,
+                                 ValidateResults* results) {
     auto rawHash = ks.hash(indexInfo->indexNameHash);
     auto hashLower = rawHash % kNumHashBuckets;
     auto hashUpper = (rawHash / kNumHashBuckets) % kNumHashBuckets;
@@ -318,7 +379,7 @@ void IndexConsistency::addDocKey(OperationContext* opCtx,
         upper.bucketSizeBytes += ks.getSize();
         indexInfo->numRecords++;
 
-        if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
+        if (MONGO_unlikely(_validateState->logDiagnostics())) {
             LOGV2(4666602,
                   "[validate](record) Adding with hashes",
                   "hashUpper"_attr = hashUpper,
@@ -348,9 +409,6 @@ void IndexConsistency::addDocKey(OperationContext* opCtx,
         invariant(_missingIndexEntries.count(key) == 0);
         _missingIndexEntries.insert(
             std::make_pair(key, IndexEntryInfo(*indexInfo, recordId, idKeyBuilder.obj(), ks)));
-
-        // Prints the collection document's metadata.
-        _validateState->getCollection()->getRecordStore()->printRecordMetadata(opCtx, recordId);
     }
 }
 
@@ -374,7 +432,7 @@ void IndexConsistency::addIndexKey(OperationContext* opCtx,
         upper.bucketSizeBytes += ks.getSize();
         indexInfo->numKeys++;
 
-        if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
+        if (MONGO_unlikely(_validateState->logDiagnostics())) {
             LOGV2(4666603,
                   "[validate](index) Adding with hashes",
                   "hashUpper"_attr = hashUpper,
@@ -423,9 +481,12 @@ void IndexConsistency::addIndexKey(OperationContext* opCtx,
                 SimpleBSONObjSet infoSet = {info};
                 _extraIndexEntries.insert(std::make_pair(key, infoSet));
 
-                // Prints the collection document's metadata.
-                _validateState->getCollection()->getRecordStore()->printRecordMetadata(opCtx,
-                                                                                       recordId);
+                // Prints the collection document's and index entry's metadata.
+                _validateState->getCollection()->getRecordStore()->printRecordMetadata(
+                    opCtx, recordId, &(results->recordTimestamps));
+                indexInfo->accessMethod->asSortedData()
+                    ->getSortedDataInterface()
+                    ->printIndexEntryMetadata(opCtx, ks);
                 return;
             }
             search->second.insert(info);
@@ -453,48 +514,57 @@ bool IndexConsistency::limitMemoryUsageForSecondPhase(ValidateResults* result) {
         return true;
     }
 
-    bool hasNonZeroBucket = false;
-    uint64_t memoryUsedSoFarBytes = 0;
-    uint32_t smallestBucketBytes = std::numeric_limits<uint32_t>::max();
-    // Zero out any nonzero buckets that would put us over maxMemoryUsageBytes.
-    std::for_each(_indexKeyBuckets.begin(), _indexKeyBuckets.end(), [&](IndexKeyBucket& bucket) {
-        if (bucket.indexKeyCount == 0) {
-            return;
-        }
+    // At this point we know we'll exceed the memory limit, and will pare back some of the buckets.
+    // First we'll see what the smallest bucket is, and if that's over the limit by itself, then
+    // we can zero out all the other buckets. Otherwise we'll keep as many buckets as we can.
 
-        smallestBucketBytes = std::min(smallestBucketBytes, bucket.bucketSizeBytes);
-        if (bucket.bucketSizeBytes + memoryUsedSoFarBytes > maxMemoryUsageBytes) {
-            // Including this bucket would put us over the memory limit, so zero this bucket. We
-            // don't want to keep any entry that will exceed the memory limit in the second phase so
-            // we don't double the 'maxMemoryUsageBytes' here.
-            bucket.indexKeyCount = 0;
-            return;
-        }
-        memoryUsedSoFarBytes += bucket.bucketSizeBytes;
-        hasNonZeroBucket = true;
-    });
+    auto smallestBucketWithAnInconsistency = std::min_element(
+        _indexKeyBuckets.begin(),
+        _indexKeyBuckets.end(),
+        [](const IndexKeyBucket& lhs, const IndexKeyBucket& rhs) {
+            if (lhs.indexKeyCount != 0) {
+                return rhs.indexKeyCount == 0 || lhs.bucketSizeBytes < rhs.bucketSizeBytes;
+            }
+            return false;
+        });
+    invariant(smallestBucketWithAnInconsistency->indexKeyCount != 0);
 
-    StringBuilder memoryLimitMessage;
-    memoryLimitMessage << "Memory limit for validation is currently set to "
-                       << maxValidateMemoryUsageMB.load()
-                       << "MB and can be configured via the 'maxValidateMemoryUsageMB' parameter.";
+    if (smallestBucketWithAnInconsistency->bucketSizeBytes > maxMemoryUsageBytes) {
+        // We're going to just keep the smallest bucket, and zero everything else.
+        std::for_each(
+            _indexKeyBuckets.begin(), _indexKeyBuckets.end(), [&](IndexKeyBucket& bucket) {
+                if (&bucket == &(*smallestBucketWithAnInconsistency)) {
+                    // We keep the smallest bucket.
+                    return;
+                }
 
-    if (!hasNonZeroBucket) {
-        const uint32_t minMemoryNeededMB = (smallestBucketBytes / (1024 * 1024)) + 1;
-        StringBuilder ss;
-        ss << "Unable to report index entry inconsistencies due to memory limitations. Need at "
-              "least "
-           << minMemoryNeededMB << "MB to report at least one index entry inconsistency. "
-           << memoryLimitMessage.str();
-        result->errors.push_back(ss.str());
-        result->valid = false;
+                bucket.indexKeyCount = 0;
+            });
+    } else {
+        // We're going to scan through the buckets and keep as many as we can.
+        std::uint32_t memoryUsedSoFarBytes = 0;
+        std::for_each(
+            _indexKeyBuckets.begin(), _indexKeyBuckets.end(), [&](IndexKeyBucket& bucket) {
+                if (bucket.indexKeyCount == 0) {
+                    return;
+                }
 
-        return false;
+                if (bucket.bucketSizeBytes + memoryUsedSoFarBytes > maxMemoryUsageBytes) {
+                    // Including this bucket would put us over the memory limit, so zero this
+                    // bucket. We don't want to keep any entry that will exceed the memory limit in
+                    // the second phase so we don't double the 'maxMemoryUsageBytes' here.
+                    bucket.indexKeyCount = 0;
+                    return;
+                }
+                memoryUsedSoFarBytes += bucket.bucketSizeBytes;
+            });
     }
 
     StringBuilder ss;
-    ss << "Not all index entry inconsistencies are reported due to memory limitations. "
-       << memoryLimitMessage.str();
+    ss << "Not all index entry inconsistencies are reported due to memory limitations. Memory "
+          "limit for validation is currently set to "
+       << maxValidateMemoryUsageMB.load()
+       << "MB and can be configured via the 'maxValidateMemoryUsageMB' parameter.";
     result->errors.push_back(ss.str());
     result->valid = false;
 
@@ -540,4 +610,16 @@ uint32_t IndexConsistency::_hashKeyString(const KeyString::Value& ks,
                                           uint32_t indexNameHash) const {
     return ks.hash(indexNameHash);
 }
+
+void IndexConsistency::_printMetadata(OperationContext* opCtx,
+                                      ValidateResults* results,
+                                      const IndexEntryInfo& entryInfo) {
+    _validateState->getCollection()->getRecordStore()->printRecordMetadata(
+        opCtx, entryInfo.recordId, &(results->recordTimestamps));
+    getIndexInfo(entryInfo.indexName)
+        .accessMethod->asSortedData()
+        ->getSortedDataInterface()
+        ->printIndexEntryMetadata(opCtx, entryInfo.keyString);
+}
+
 }  // namespace mongo

@@ -373,6 +373,7 @@ RECNO
 REF's
 REFs
 RET
+RETRYABLE
 RHEL
 RLE
 RLEs
@@ -411,6 +412,7 @@ STEC
 STL
 STR
 STRUCT
+SYSCALL
 Scalability
 Scalable
 Sedgewick

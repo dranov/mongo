@@ -415,7 +415,7 @@ void LockerImpl::lockGlobal(OperationContext* opCtx, LockMode mode, Date_t deadl
         return;
 
     invariant(result == LOCK_WAITING);
-    _lockComplete(opCtx, resourceIdGlobal, mode, deadline);
+    _lockComplete(opCtx, resourceIdGlobal, mode, deadline, nullptr);
 }
 
 bool LockerImpl::unlockGlobal() {
@@ -550,7 +550,7 @@ void LockerImpl::lock(OperationContext* opCtx, ResourceId resId, LockMode mode, 
         return;
 
     invariant(result == LOCK_WAITING);
-    _lockComplete(opCtx, resId, mode, deadline);
+    _lockComplete(opCtx, resId, mode, deadline, nullptr);
 }
 
 void LockerImpl::downgrade(ResourceId resId, LockMode newMode) {
@@ -818,9 +818,17 @@ void LockerImpl::restoreLockState(OperationContext* opCtx, const Locker::LockSna
     }
 
     std::vector<OneLock>::const_iterator it = state.locks.begin();
-    // If we locked the PBWM, it must be locked before the resourceIdGlobal and
-    // resourceIdReplicationStateTransitionLock resources.
+    // If we locked the PBWM, it must be locked before the
+    // resourceIdFeatureCompatibilityVersion, resourceIdReplicationStateTransitionLock, and
+    // resourceIdGlobal resources.
     if (it != state.locks.end() && it->resourceId == resourceIdParallelBatchWriterMode) {
+        lock(opCtx, it->resourceId, it->mode);
+        it++;
+    }
+
+    // If we locked the FCV lock, it must be locked before the
+    // resourceIdReplicationStateTransitionLock and resourceIdGlobal resources.
+    if (it != state.locks.end() && it->resourceId == resourceIdFeatureCompatibilityVersion) {
         lock(opCtx, it->resourceId, it->mode);
         it++;
     }
@@ -833,6 +841,8 @@ void LockerImpl::restoreLockState(OperationContext* opCtx, const Locker::LockSna
 
     lockGlobal(opCtx, state.globalMode);
     for (; it != state.locks.end(); it++) {
+        // Ensures we don't acquire locks out of order which can lead to deadlock.
+        invariant(it->resourceId.getType() != ResourceType::RESOURCE_GLOBAL);
         lock(opCtx, it->resourceId, it->mode);
     }
     invariant(_modeForTicket != MODE_NONE);
@@ -932,7 +942,8 @@ LockResult LockerImpl::_lockBegin(OperationContext* opCtx, ResourceId resId, Loc
 void LockerImpl::_lockComplete(OperationContext* opCtx,
                                ResourceId resId,
                                LockMode mode,
-                               Date_t deadline) {
+                               Date_t deadline,
+                               const LockTimeoutCallback& onTimeout) {
     // Operations which are holding open an oplog hole cannot block when acquiring locks. Lock
     // requests entering this function have been queued up and will be granted the lock as soon as
     // the lock is released, which is a blocking operation.
@@ -1017,6 +1028,9 @@ void LockerImpl::_lockComplete(OperationContext* opCtx,
         // Check if the lock acquisition has timed out. If we have an operation context and client
         // we can provide additional diagnostics data.
         if (waitTime == Milliseconds(0)) {
+            if (onTimeout) {
+                onTimeout();
+            }
             std::string timeoutMessage = str::stream()
                 << "Unable to acquire " << modeName(mode) << " lock on '" << resId.toString()
                 << "' within " << timeout << ".";
@@ -1064,8 +1078,11 @@ LockResult LockerImpl::lockRSTLBegin(OperationContext* opCtx, LockMode mode) {
     return _lockBegin(opCtx, resourceIdReplicationStateTransitionLock, mode);
 }
 
-void LockerImpl::lockRSTLComplete(OperationContext* opCtx, LockMode mode, Date_t deadline) {
-    _lockComplete(opCtx, resourceIdReplicationStateTransitionLock, mode, deadline);
+void LockerImpl::lockRSTLComplete(OperationContext* opCtx,
+                                  LockMode mode,
+                                  Date_t deadline,
+                                  const LockTimeoutCallback& onTimeout) {
+    _lockComplete(opCtx, resourceIdReplicationStateTransitionLock, mode, deadline, onTimeout);
 }
 
 void LockerImpl::releaseTicket() {

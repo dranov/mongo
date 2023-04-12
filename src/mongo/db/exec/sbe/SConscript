@@ -23,7 +23,7 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/exec/js_function',
         '$BUILD_DIR/mongo/db/fts/base_fts',
-        '$BUILD_DIR/mongo/db/index/key_generator',
+        '$BUILD_DIR/mongo/db/index/index_access_method',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface',
         '$BUILD_DIR/mongo/db/query/datetime/date_time_support',
         '$BUILD_DIR/mongo/db/query/query_index_bounds',
@@ -59,8 +59,9 @@ sbeEnv.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
         '$BUILD_DIR/mongo/db/sorter/sorter_idl',
-         ]
-    )
+        '$BUILD_DIR/mongo/db/sorter/sorter_stats',
+    ],
+)
 
 sbeEnv.Library(
     target='query_sbe_stages',
@@ -89,7 +90,6 @@ sbeEnv.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/exec/js_function',
         '$BUILD_DIR/mongo/db/exec/scoped_timer',
         '$BUILD_DIR/mongo/db/query/plan_yield_policy',
@@ -106,6 +106,7 @@ sbeEnv.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
         '$BUILD_DIR/mongo/db/sorter/sorter_idl',
+        '$BUILD_DIR/mongo/db/sorter/sorter_stats',
         'query_sbe',
         'query_sbe_storage',
          ]

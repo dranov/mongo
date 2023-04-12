@@ -57,7 +57,7 @@ assert.eq(res.actualCollection, null);
 
 // 5. The command fails when the provided UUID corresponds to a different collection, even if the
 // provided namespace does not exist.
-coll2.drop();
+assert.commandWorked(testDB.runCommand({drop: coll2.getName()}));
 res = assert.commandFailedWithCode(
     testDB.runCommand({collMod: coll2.getName(), collectionUUID: uuid}),
     ErrorCodes.CollectionUUIDMismatch);
@@ -65,4 +65,15 @@ assert.eq(res.db, testDB.getName());
 assert.eq(res.collectionUUID, uuid);
 assert.eq(res.expectedCollection, coll2.getName());
 assert.eq(res.actualCollection, coll.getName());
+assert(!testDB.getCollectionNames().includes(coll2.getName()));
+
+// 6. The command fails with CollectionUUIDMismatch even if the database does not exist.
+const nonexistentDB = testDB.getSiblingDB(testDB.getName() + '_nonexistent');
+res = assert.commandFailedWithCode(
+    nonexistentDB.runCommand({collMod: 'nonexistent', collectionUUID: uuid}),
+    ErrorCodes.CollectionUUIDMismatch);
+assert.eq(res.db, nonexistentDB.getName());
+assert.eq(res.collectionUUID, uuid);
+assert.eq(res.expectedCollection, 'nonexistent');
+assert.eq(res.actualCollection, null);
 })();

@@ -150,6 +150,19 @@ public:
 };
 
 /**
+ * Use `throwTransactionTooLargeForCache()` instead of throwing
+ * `TransactionTooLargeForCache` directly.
+ */
+class TransactionTooLargeForCacheException final : public DBException {
+public:
+    TransactionTooLargeForCacheException(const Status& status) : DBException(status) {}
+
+private:
+    void defineOnlyInFinalSubclassToPreventSlicing() final {}
+};
+
+
+/**
  * The base class of all DBExceptions for codes of the given ErrorCategory to allow catching by
  * category.
  */
@@ -165,6 +178,8 @@ protected:
     }
 };
 
+class WriteConflictException;
+class TemporarilyUnavailableException;
 
 /**
  * This namespace contains implementation details for our error handling code and should not be used
@@ -201,6 +216,21 @@ struct ExceptionForDispatcher<code, CategoryList<categories...>> {
     using type = std::conditional_t<sizeof...(categories) == 0,
                                     ExceptionForImpl<code, AssertionException>,
                                     ExceptionForImpl<code, ExceptionForCat<categories>...>>;
+};
+
+template <>
+struct ExceptionForDispatcher<ErrorCodes::WriteConflict> {
+    using type = WriteConflictException;
+};
+
+template <>
+struct ExceptionForDispatcher<ErrorCodes::TemporarilyUnavailable> {
+    using type = TemporarilyUnavailableException;
+};
+
+template <>
+struct ExceptionForDispatcher<ErrorCodes::TransactionTooLargeForCache> {
+    using type = TransactionTooLargeForCacheException;
 };
 
 }  // namespace error_details

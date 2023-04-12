@@ -1,7 +1,7 @@
 /*
  * Test that $group and $setWindowFields spill to the WT RecordStore on secondaries with
  * writeConcern greater than w:1.
- * @tags: [requires_replication, requires_majority_read_concern]
+ * @tags: [requires_replication, requires_majority_read_concern, requires_persistence]
  */
 (function() {
 "use strict";
@@ -9,8 +9,9 @@
 load("jstests/libs/sbe_explain_helpers.js");  // For getSbePlanStages.
 load("jstests/libs/sbe_util.js");             // For checkSBEEnabled.
 
+const kNumNodes = 3;
 const replTest = new ReplSetTest({
-    nodes: 3,
+    nodes: kNumNodes,
 });
 
 replTest.startSet();
@@ -20,15 +21,18 @@ replTest.initiate();
  * Setup the primary and secondary collections.
  */
 let primary = replTest.getPrimary();
-const insertColl = primary.getDB("test").foo;
+let bulk = primary.getDB("test").foo.initializeUnorderedBulkOp();
 const cRecords = 50;
 for (let i = 0; i < cRecords; ++i) {
     // We'll be using a unique 'key' field for group & lookup, but we cannot use '_id' for this,
     // because '_id' is indexed and would trigger Indexed Loop Join instead of Hash Join.
-    assert.commandWorked(insertColl.insert({key: i, string: "test test test"}));
+    bulk.insert({key: i, string: "test test test"});
 }
+assert.commandWorked(bulk.execute({w: kNumNodes, wtimeout: 5000}));
 
 let secondary = replTest.getSecondary();
+// Wait for the insertion to be visible on 'secondary'.
+replTest.awaitLastOpCommitted(null, [secondary]);
 const readColl = secondary.getDB("test").foo;
 
 /**
@@ -87,7 +91,10 @@ const readColl = secondary.getDB("test").foo;
         assert(hashAggGroup.hasOwnProperty("usedDisk"), hashAggGroup);
         assert(hashAggGroup.usedDisk, hashAggGroup);
         assert.eq(hashAggGroup.spilledRecords, expectedSpilledRecords, hashAggGroup);
-        assert.gte(hashAggGroup.spilledBytesApprox, expectedSpilledBytesAtLeast, hashAggGroup);
+        // We expect each record to be individually spilled, so the number of spill events and the
+        // number of spilled records should be equal.
+        assert.eq(hashAggGroup.numSpills, hashAggGroup.spilledRecords, hashAggGroup);
+        assert.gt(hashAggGroup.spilledDataStorageSize, expectedSpilledBytesAtLeast, hashAggGroup);
     } finally {
         assert.commandWorked(secondary.adminCommand({
             setParameter: 1,

@@ -162,7 +162,7 @@ assert.eq(res.actualCollection, null);
 
 // The command fails when the provided UUID corresponds to a different collection, even if the
 // provided source namespace does not exist.
-coll2.drop();
+assert.commandWorked(testDB.runCommand({drop: coll2.getName()}));
 res = assert.commandFailedWithCode(testDB.adminCommand({
     renameCollection: coll2.getFullName(),
     to: coll3.getFullName(),
@@ -174,6 +174,21 @@ assert.eq(res.db, testDB.getName());
 assert.eq(res.collectionUUID, uuid(coll));
 assert.eq(res.expectedCollection, coll2.getName());
 assert.eq(res.actualCollection, coll.getName());
+assert(!testDB.getCollectionNames().includes(coll2.getName()));
+
+// The command fails with CollectionUUIDMismatch even if the database does not exist.
+const nonexistentDB = testDB.getSiblingDB(testDB.getName() + '_nonexistent');
+res = assert.commandFailedWithCode(testDB.adminCommand({
+    renameCollection: nonexistentDB.getName() + '.nonexistent',
+    to: nonexistentDB.getName() + '.nonexistent_2',
+    dropTarget: true,
+    collectionUUID: uuid(coll),
+}),
+                                   ErrorCodes.CollectionUUIDMismatch);
+assert.eq(res.db, nonexistentDB.getName());
+assert.eq(res.collectionUUID, uuid(coll));
+assert.eq(res.expectedCollection, 'nonexistent');
+assert.eq(res.actualCollection, null);
 
 // The collectionUUID parameter cannot be provided when renaming a collection between databases.
 const otherDBColl = db.getSiblingDB(jsTestName() + '_2').coll;

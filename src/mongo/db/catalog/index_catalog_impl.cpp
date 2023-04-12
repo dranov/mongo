@@ -47,7 +47,6 @@
 #include "mongo/db/catalog/uncommitted_catalog_updates.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/fts/fts_spec.h"
@@ -205,13 +204,30 @@ Status IndexCatalogImpl::init(OperationContext* opCtx, Collection* collection) {
 
         auto descriptor = std::make_unique<IndexDescriptor>(_getAccessMethodName(keyPattern), spec);
 
+        // TTL indexes with NaN 'expireAfterSeconds' cause problems in multiversion settings.
+        if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
+            if (spec[IndexDescriptor::kExpireAfterSecondsFieldName].isNaN()) {
+                LOGV2_OPTIONS(6852200,
+                              {logv2::LogTag::kStartupWarnings},
+                              "Found an existing TTL index with NaN 'expireAfterSeconds' in the "
+                              "catalog.",
+                              "ns"_attr = collection->ns(),
+                              "uuid"_attr = collection->uuid(),
+                              "index"_attr = indexName,
+                              "spec"_attr = spec);
+            }
+        }
+
         // TTL indexes are not compatible with capped collections.
         // Note that TTL deletion is supported on capped clustered collections via bounded
         // collection scan, which does not use an index.
         if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName) &&
             !collection->isCapped()) {
             TTLCollectionCache::get(opCtx->getServiceContext())
-                .registerTTLInfo(collection->uuid(), indexName);
+                .registerTTLInfo(
+                    collection->uuid(),
+                    TTLCollectionCache::Info{
+                        indexName, spec[IndexDescriptor::kExpireAfterSecondsFieldName].isNaN()});
         }
 
         bool ready = collection->isIndexReady(indexName);
@@ -539,7 +555,7 @@ IndexCatalogEntry* IndexCatalogImpl::createIndexEntry(OperationContext* opCtx,
         opCtx, collection->ns(), collOptions, ident, desc);
 
     std::unique_ptr<IndexAccessMethod> accessMethod =
-        IndexAccessMethodFactory::get(opCtx)->make(entry.get(), std::move(sdi));
+        IndexAccessMethod::make(entry.get(), std::move(sdi));
 
     entry->init(std::move(accessMethod));
 
@@ -873,10 +889,11 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx,
         }
         const std::unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
-        Status status =
-            _checkValidFilterExpressions(filterExpr.get(),
-                                         feature_flags::gTimeseriesMetricIndexes.isEnabled(
-                                             serverGlobalParams.featureCompatibility));
+        Status status = _checkValidFilterExpressions(
+            filterExpr.get(),
+            !serverGlobalParams.featureCompatibility.isVersionInitialized() ||
+                feature_flags::gTimeseriesMetricIndexes.isEnabled(
+                    serverGlobalParams.featureCompatibility));
         if (!status.isOK()) {
             return status;
         }
@@ -1779,7 +1796,11 @@ void IndexCatalogImpl::indexBuildSuccess(OperationContext* opCtx,
     invariant(releasedEntry.get() == index);
     _readyIndexes.add(std::move(releasedEntry));
 
-    index->setIndexBuildInterceptor(nullptr);
+    // Wait to unset the interceptor until the index actually commits. If a write conflict is
+    // encountered and the index commit process is restated, the multikey information from the
+    // interceptor may still be needed.
+    opCtx->recoveryUnit()->onCommit(
+        [index](boost::optional<Timestamp>) { index->setIndexBuildInterceptor(nullptr); });
     index->setIsReady(true);
 }
 

@@ -292,6 +292,7 @@ InitialSyncerInterface::Options createInitialSyncerOptions(
                                externalState](const OpTimeAndWallTime& opTimeAndWallTime) {
         // Note that setting the last applied opTime forward also advances the global timestamp.
         replCoord->setMyLastAppliedOpTimeAndWallTimeForward(opTimeAndWallTime);
+        signalOplogWaiters();
         // The oplog application phase of initial sync starts timestamping writes, causing
         // WiredTiger to pin this data in memory. Advancing the oldest timestamp in step with the
         // last applied optime here will permit WiredTiger to evict this data as it sees fit.
@@ -336,6 +337,16 @@ ReplicationCoordinatorImpl::ReplicationCoordinatorImpl(
       _readWriteAbility(std::make_unique<ReadWriteAbility>(!settings.usingReplSets())),
       _replicationProcess(replicationProcess),
       _storage(storage),
+      _handleLivenessTimeoutCallback(_replExecutor.get(),
+                                     [this](const executor::TaskExecutor::CallbackArgs& args) {
+                                         _handleLivenessTimeout(args);
+                                     }),
+      _handleElectionTimeoutCallback(
+          _replExecutor.get(),
+          [this](const executor::TaskExecutor::CallbackArgs&) {
+              _startElectSelfIfEligibleV1(StartElectionReasonEnum::kElectionTimeout);
+          },
+          [this](int64_t limit) { return _nextRandomInt64_inlock(limit); }),
       _random(prngSeed) {
 
     _termShadow.store(OpTime::kUninitializedTerm);
@@ -382,10 +393,7 @@ ReplSetConfig ReplicationCoordinatorImpl::getReplicaSetConfig_forTest() {
 
 Date_t ReplicationCoordinatorImpl::getElectionTimeout_forTest() const {
     stdx::lock_guard<Latch> lk(_mutex);
-    if (!_handleElectionTimeoutCbh.isValid()) {
-        return Date_t();
-    }
-    return _handleElectionTimeoutWhen;
+    return _handleElectionTimeoutCallback.getNextCall();
 }
 
 Milliseconds ReplicationCoordinatorImpl::getRandomizedElectionOffset_forTest() {
@@ -828,6 +836,7 @@ void ReplicationCoordinatorImpl::_initialSyncerCompletionFunction(
 
         const auto lastApplied = opTimeStatus.getValue();
         _setMyLastAppliedOpTimeAndWallTime(lock, lastApplied, false);
+        signalOplogWaiters();
 
         _topCoord->resetMaintenanceCount();
     }
@@ -1005,6 +1014,10 @@ bool ReplicationCoordinatorImpl::enterQuiesceModeIfSecondary(Milliseconds quiesc
     if (!_memberState.secondary()) {
         return false;
     }
+
+    // Cancel any ongoing election so that the node cannot become primary once in quiesce mode,
+    // and do not wait for cancellation to complete.
+    _cancelElectionIfNeeded(lk);
 
     _inQuiesceMode = true;
     _quiesceDeadline = _replExecutor->now() + quiesceTime;
@@ -1399,6 +1412,7 @@ void ReplicationCoordinatorImpl::setMyLastAppliedOpTimeAndWallTime(
     stdx::unique_lock<Latch> lock(_mutex);
     // The optime passed to this function is required to represent a consistent database state.
     _setMyLastAppliedOpTimeAndWallTime(lock, opTimeAndWallTime, false);
+    signalOplogWaiters();
     _reportUpstream_inlock(std::move(lock));
 }
 
@@ -1471,9 +1485,6 @@ void ReplicationCoordinatorImpl::_setMyLastAppliedOpTimeAndWallTime(
             return waitOpTime <= opTime;
         },
         opTime);
-
-    // Notify the oplog waiters after updating the local snapshot.
-    signalOplogWaiters();
 
     if (opTime.isNull()) {
         return;
@@ -1858,7 +1869,7 @@ Status ReplicationCoordinatorImpl::_setLastOptime(WithLock lk,
         _wakeReadyWaiters(lk, std::max(args.appliedOpTime, args.durableOpTime));
     }
 
-    _cancelAndRescheduleLivenessUpdate_inlock(args.memberId);
+    _rescheduleLivenessUpdate_inlock(args.memberId);
     return Status::OK();
 }
 
@@ -2576,33 +2587,28 @@ ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::AutoGetRstlForStepUpSt
         deadline = start + Seconds(rstlTimeout);  // cap deadline
     }
 
-    try {
-        // Enqueues RSTL in X mode.
-        _rstlLock.emplace(_opCtx, MODE_X, ReplicationStateTransitionLockGuard::EnqueueOnly());
+    _rstlLock.emplace(_opCtx, MODE_X, ReplicationStateTransitionLockGuard::EnqueueOnly());
 
-        ON_BLOCK_EXIT([&] { _stopAndWaitForKillOpThread(); });
-        _startKillOpThread();
+    ON_BLOCK_EXIT([&] { _stopAndWaitForKillOpThread(); });
+    _startKillOpThread();
 
-        // Wait for RSTL to be acquired.
-        _rstlLock->waitForLockUntil(deadline);
-
-    } catch (const ExceptionFor<ErrorCodes::LockTimeout>&) {
-        if (rstlTimeout > 0 && Date_t::now() - start >= Seconds(rstlTimeout)) {
-            // Dump all locks to identify which thread(s) are holding RSTL.
-            getGlobalLockManager()->dump();
-
-            auto lockerInfo =
-                opCtx->lockState()->getLockerInfo(CurOp::get(opCtx)->getLockStatsBase());
-            BSONObjBuilder lockRep;
-            lockerInfo->stats.report(&lockRep);
-            LOGV2_FATAL(5675600,
-                        "Time out exceeded waiting for RSTL, stepUp/stepDown is not possible "
-                        "thus calling abort() to allow cluster to progress.",
-                        "lockRep"_attr = lockRep.obj());
+    // Wait for RSTL to be acquired.
+    _rstlLock->waitForLockUntil(deadline, [opCtx, rstlTimeout, start] {
+        if (rstlTimeout <= 0 || Date_t::now() - start < Seconds{rstlTimeout}) {
+            return;
         }
-        // Rethrow to keep processing as before at a higher layer.
-        throw;
-    }
+
+        // Dump all locks to identify which thread(s) are holding RSTL.
+        getGlobalLockManager()->dump();
+
+        auto lockerInfo = opCtx->lockState()->getLockerInfo(CurOp::get(opCtx)->getLockStatsBase());
+        BSONObjBuilder lockRep;
+        lockerInfo->stats.report(&lockRep);
+        LOGV2_FATAL(5675600,
+                    "Time out exceeded waiting for RSTL, stepUp/stepDown is not possible thus "
+                    "calling abort() to allow cluster to progress",
+                    "lockRep"_attr = lockRep.obj());
+    });
 };
 
 void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::_startKillOpThread() {
@@ -5675,6 +5681,8 @@ Status ReplicationCoordinatorImpl::processReplSetRequestVotes(
         LastVote lastVote{args.getTerm(), args.getCandidateIndex()};
         Status status = _externalState->storeLocalLastVoteDocument(opCtx, lastVote);
         if (!status.isOK()) {
+            // Note the topology coordinator has already advanced its last vote at this point,
+            // so this node will not be able to vote in this election; this is a "spoiled" vote.
             LOGV2_ERROR(21428,
                         "replSetRequestVotes failed to store LastVote document",
                         "error"_attr = status);

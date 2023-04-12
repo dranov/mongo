@@ -507,7 +507,7 @@ void DocumentSourceGraphLookUp::performSearch() {
 }
 
 DocumentSource::GetModPathsReturn DocumentSourceGraphLookUp::getModifiedPaths() const {
-    std::set<std::string> modifiedPaths{_as.fullPath()};
+    OrderedPathSet modifiedPaths{_as.fullPath()};
     if (_unwind) {
         auto pathsModifiedByUnwind = _unwind.get()->getModifiedPaths();
         invariant(pathsModifiedByUnwind.type == GetModPathsReturn::Type::kFiniteSet);
@@ -623,6 +623,7 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
       _variablesParseState(expCtx->variablesParseState.copyWith(_variables.useIdGenerator())) {
     const auto& resolvedNamespace = pExpCtx->getResolvedNamespace(_from);
     _fromExpCtx = pExpCtx->copyForSubPipeline(resolvedNamespace.ns, resolvedNamespace.uuid);
+    _fromExpCtx->inLookup = true;
 
     // We append an additional BSONObj to '_fromPipeline' as a placeholder for the $match stage
     // we'll eventually construct from the input document.

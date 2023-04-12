@@ -76,27 +76,39 @@ boost::optional<BSONObj> DropCollectionCoordinator::reportForCurrentOp(
     return bob.obj();
 }
 
-DropReply DropCollectionCoordinator::dropCollectionLocally(OperationContext* opCtx,
-                                                           const NamespaceString& nss) {
+void DropCollectionCoordinator::dropCollectionLocally(OperationContext* opCtx,
+                                                      const NamespaceString& nss,
+                                                      bool fromMigrate) {
     {
         // Clear CollectionShardingRuntime entry
         Lock::DBLock dbLock(opCtx, nss.db(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
         auto* csr = CollectionShardingRuntime::get(opCtx, nss);
-        csr->clearFilteringMetadata(opCtx);
+        csr->clearFilteringMetadataForDroppedCollection(opCtx);
     }
 
-    DropReply result;
-    uassertStatusOK(dropCollection(
-        opCtx, nss, &result, DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
+    try {
+        DropReply unused;
+        uassertStatusOK(
+            dropCollection(opCtx,
+                           nss,
+                           &unused,
+                           DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops,
+                           fromMigrate));
+    } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+        // Note that even if the namespace was not found we have to execute the code below!
+        LOGV2_DEBUG(5280920,
+                    1,
+                    "Namespace not found while trying to delete local collection",
+                    "namespace"_attr = nss);
+    }
 
-    // Force the refresh of the catalog cache to purge outdated information
+    // Force the refresh of the catalog cache to purge outdated information. Note also that this
+    // code is indirectly used to notify to secondary nodes to clear their filtering information.
     const auto catalog = Grid::get(opCtx)->catalogCache();
     uassertStatusOK(catalog->getCollectionRoutingInfoWithRefresh(opCtx, nss));
     CatalogCacheLoader::get(opCtx).waitForCollectionFlush(opCtx, nss);
     repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
-
-    return result;
 }
 
 void DropCollectionCoordinator::_enterPhase(Phase newPhase) {
@@ -215,13 +227,23 @@ ExecutorFuture<void> DropCollectionCoordinator::_runImpl(
                     participants.end());
 
                 sharding_ddl_util::sendDropCollectionParticipantCommandToShards(
-                    opCtx, nss(), participants, **executor, getCurrentSession(_doc));
+                    opCtx,
+                    nss(),
+                    participants,
+                    **executor,
+                    getCurrentSession(_doc),
+                    false /*fromMigrate*/);
 
                 // The sharded collection must be dropped on the primary shard after it has been
                 // dropped on all of the other shards to ensure it can only be re-created as
                 // unsharded with a higher optime than all of the drops.
                 sharding_ddl_util::sendDropCollectionParticipantCommandToShards(
-                    opCtx, nss(), {primaryShardId}, **executor, getCurrentSession(_doc));
+                    opCtx,
+                    nss(),
+                    {primaryShardId},
+                    **executor,
+                    getCurrentSession(_doc),
+                    false /*fromMigrate*/);
 
                 ShardingLogging::get(opCtx)->logChange(opCtx, "dropCollection", nss().ns());
                 LOGV2(5390503, "Collection dropped", "namespace"_attr = nss());

@@ -31,7 +31,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/index/btree_access_method.h"
+#include "mongo/db/index/index_access_method.h"
 
 #include <utility>
 #include <vector>
@@ -42,10 +42,17 @@
 #include "mongo/db/catalog/index_consistency.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/index/2d_access_method.h"
+#include "mongo/db/index/btree_access_method.h"
+#include "mongo/db/index/fts_access_method.h"
+#include "mongo/db/index/hash_access_method.h"
 #include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/s2_access_method.h"
+#include "mongo/db/index/s2_bucket_access_method.h"
+#include "mongo/db/index/wildcard_access_method.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
@@ -53,6 +60,7 @@
 #include "mongo/db/repl/timestamp_block.h"
 #include "mongo/db/sorter/sorter.h"
 #include "mongo/db/storage/execution_context.h"
+#include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
@@ -70,6 +78,35 @@ MONGO_FAIL_POINT_DEFINE(hangIndexBuildDuringBulkLoadPhase);
 MONGO_FAIL_POINT_DEFINE(hangIndexBuildDuringBulkLoadPhaseSecond);
 MONGO_FAIL_POINT_DEFINE(hangDuringIndexBuildBulkLoadYield);
 MONGO_FAIL_POINT_DEFINE(hangDuringIndexBuildBulkLoadYieldSecond);
+
+/**
+ * Static factory method that constructs and returns an appropriate IndexAccessMethod depending on
+ * the type of the index.
+ */
+std::unique_ptr<IndexAccessMethod> IndexAccessMethod::make(
+    IndexCatalogEntry* entry, std::unique_ptr<SortedDataInterface> sortedDataInterface) {
+    auto desc = entry->descriptor();
+    const std::string& type = desc->getAccessMethodName();
+    if ("" == type)
+        return std::make_unique<BtreeAccessMethod>(entry, std::move(sortedDataInterface));
+    else if (IndexNames::HASHED == type)
+        return std::make_unique<HashAccessMethod>(entry, std::move(sortedDataInterface));
+    else if (IndexNames::GEO_2DSPHERE == type)
+        return std::make_unique<S2AccessMethod>(entry, std::move(sortedDataInterface));
+    else if (IndexNames::GEO_2DSPHERE_BUCKET == type)
+        return std::make_unique<S2BucketAccessMethod>(entry, std::move(sortedDataInterface));
+    else if (IndexNames::TEXT == type)
+        return std::make_unique<FTSAccessMethod>(entry, std::move(sortedDataInterface));
+    else if (IndexNames::GEO_2D == type)
+        return std::make_unique<TwoDAccessMethod>(entry, std::move(sortedDataInterface));
+    else if (IndexNames::WILDCARD == type)
+        return std::make_unique<WildcardAccessMethod>(entry, std::move(sortedDataInterface));
+    LOGV2(20688,
+          "Can't find index for keyPattern {keyPattern}",
+          "Can't find index for keyPattern",
+          "keyPattern"_attr = desc->keyPattern());
+    fassertFailed(31021);
+}
 
 namespace {
 
@@ -99,6 +136,10 @@ public:
         builder.append("resumed", resumed.loadRelaxed());
         builder.append("filesOpenedForExternalSort", sorterFileStats.opened.loadRelaxed());
         builder.append("filesClosedForExternalSort", sorterFileStats.closed.loadRelaxed());
+        builder.append("spilledRanges", sorterTracker.spilledRanges.loadRelaxed());
+        builder.append("bytesSpilledUncompressed",
+                       sorterTracker.bytesSpilledUncompressed.loadRelaxed());
+        builder.append("bytesSpilled", sorterTracker.bytesSpilled.loadRelaxed());
         return builder.obj();
     }
 
@@ -109,11 +150,15 @@ public:
     // This value should not exceed 'count'.
     AtomicWord<long long> resumed;
 
+    // Sorter statistics that are aggregate of all sorters.
+    SorterTracker sorterTracker;
+
     // Number of times the external sorter opened/closed a file handle to spill data to disk.
     // This pair of counters in aggregate indicate the number of open file handles used by
     // the external sorter and may be useful in diagnosing situations where the process is
     // close to exhausting this finite resource.
-    SorterFileStats sorterFileStats;
+    SorterFileStats sorterFileStats = {&sorterTracker};
+
 } indexBulkBuilderSSS;
 
 /**
@@ -132,7 +177,9 @@ SortOptions makeSortOptions(size_t maxMemoryUsageBytes, StringData dbName) {
         .TempDir(storageGlobalParams.dbpath + "/_tmp")
         .ExtSortAllowed()
         .MaxMemoryUsageBytes(maxMemoryUsageBytes)
+        .UseMemoryPool(true)
         .FileStats(&indexBulkBuilderSSS.sorterFileStats)
+        .Tracker(&indexBulkBuilderSSS.sorterTracker)
         .DBName(dbName.toString());
 }
 
@@ -446,9 +493,13 @@ RecordId SortedDataIndexAccessMethod::findSingle(OperationContext* opCtx,
 void SortedDataIndexAccessMethod::validate(OperationContext* opCtx,
                                            int64_t* numKeys,
                                            IndexValidateResults* fullResults) const {
-    long long keys = 0;
-    _newInterface->fullValidate(opCtx, &keys, fullResults);
-    *numKeys = keys;
+    if (numKeys) {
+        long long keys = 0;
+        _newInterface->fullValidate(opCtx, &keys, fullResults);
+        *numKeys = keys;
+    } else {
+        _newInterface->fullValidate(opCtx, nullptr, fullResults);
+    }
 }
 
 bool SortedDataIndexAccessMethod::appendCustomStats(OperationContext* opCtx,
@@ -609,6 +660,23 @@ Ident* SortedDataIndexAccessMethod::getIdentPtr() const {
     return this->_newInterface.get();
 }
 
+void IndexAccessMethod::BulkBuilder::countNewBuildInStats() {
+    indexBulkBuilderSSS.count.addAndFetch(1);
+}
+
+void IndexAccessMethod::BulkBuilder::countResumedBuildInStats() {
+    indexBulkBuilderSSS.count.addAndFetch(1);
+    indexBulkBuilderSSS.resumed.addAndFetch(1);
+}
+
+SorterFileStats* IndexAccessMethod::BulkBuilder::bulkBuilderFileStats() {
+    return &indexBulkBuilderSSS.sorterFileStats;
+}
+
+SorterTracker* IndexAccessMethod::BulkBuilder::bulkBuilderTracker() {
+    return &indexBulkBuilderSSS.sorterTracker;
+}
+
 class SortedDataIndexAccessMethod::BulkBuilderImpl final : public IndexAccessMethod::BulkBuilder {
 public:
     using Sorter = mongo::Sorter<KeyString::Value, mongo::NullValue>;
@@ -624,7 +692,6 @@ public:
 
     Status insert(OperationContext* opCtx,
                   const CollectionPtr& collection,
-                  SharedBufferFragmentBuilder& pooledBuilder,
                   const BSONObj& obj,
                   const RecordId& loc,
                   const InsertDeleteOptions& options,
@@ -708,7 +775,6 @@ SortedDataIndexAccessMethod::BulkBuilderImpl::BulkBuilderImpl(SortedDataIndexAcc
 Status SortedDataIndexAccessMethod::BulkBuilderImpl::insert(
     OperationContext* opCtx,
     const CollectionPtr& collection,
-    SharedBufferFragmentBuilder& pooledBuilder,
     const BSONObj& obj,
     const RecordId& loc,
     const InsertDeleteOptions& options,
@@ -722,7 +788,7 @@ Status SortedDataIndexAccessMethod::BulkBuilderImpl::insert(
     try {
         _iam->getKeys(opCtx,
                       collection,
-                      pooledBuilder,
+                      _sorter->memPool(),
                       obj,
                       options.getKeysMode,
                       GetKeysContext::kAddingKeys,
@@ -1144,6 +1210,16 @@ Status SortedDataIndexAccessMethod::_indexKeysOrWriteToSideTable(
             *keysInsertedOut += inserted;
         }
     } else {
+        // Ensure that our snapshot is compatible with the index's minimum visibile snapshot.
+        const auto minVisibleTimestamp = _indexCatalogEntry->getMinimumVisibleSnapshot();
+        const auto readTimestamp =
+            opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx).value_or(
+                opCtx->recoveryUnit()->getCatalogConflictingTimestamp());
+        if (minVisibleTimestamp && !readTimestamp.isNull() &&
+            readTimestamp < *minVisibleTimestamp) {
+            throw WriteConflictException();
+        }
+
         int64_t numInserted = 0;
         status = insertKeysAndUpdateMultikeyPaths(
             opCtx,
@@ -1205,6 +1281,14 @@ void SortedDataIndexAccessMethod::_unindexKeysOrWriteToSideTable(
     // details.
     options.dupsAllowed = options.dupsAllowed || !_indexCatalogEntry->isReady(opCtx) ||
         (checkRecordId == CheckRecordId::On);
+
+    // Ensure that our snapshot is compatible with the index's minimum visibile snapshot.
+    const auto minVisibleTimestamp = _indexCatalogEntry->getMinimumVisibleSnapshot();
+    const auto readTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx).value_or(
+        opCtx->recoveryUnit()->getCatalogConflictingTimestamp());
+    if (minVisibleTimestamp && !readTimestamp.isNull() && readTimestamp < *minVisibleTimestamp) {
+        throw WriteConflictException();
+    }
 
     int64_t removed = 0;
     Status status = removeKeys(opCtx, keys, options, &removed);

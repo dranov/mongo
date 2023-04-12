@@ -227,6 +227,15 @@ var $config = (function() {
 
     function teardown(db, collName, cluster) {
         const mongos = cluster.getDB('config').getMongo();
+
+        cluster.executeOnConfigNodes((db) => {
+            assert.commandWorked(db.adminCommand({
+                configureFailPoint: 'overrideBalanceRoundInterval',
+                mode: 'alwaysOn',
+                data: {intervalMs: 100}
+            }));
+        });
+
         for (let i = 0; i < dbCount; i++) {
             const dbName = dbPrefix + i;
             for (let j = 0; j < collCount; j++) {
@@ -236,11 +245,7 @@ var $config = (function() {
                 // Enable balancing and wait for balanced
                 assertAlways.commandWorked(mongos.getDB('config').collections.update(
                     {_id: fullNs}, {$set: {"noBalance": false}}));
-                assertAlways.soon(function() {
-                    let res = mongos.adminCommand({balancerCollectionStatus: fullNs});
-                    assertAlways.commandWorked(res);
-                    return res.balancerCompliant;
-                });
+                sh.awaitCollectionBalance(mongos.getCollection(fullNs));
                 // Begin defragmentation again
                 assertAlways.commandWorked(mongos.adminCommand({
                     configureCollectionBalancing: fullNs,

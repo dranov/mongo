@@ -86,16 +86,15 @@ public:
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
-            if (fromNss.db() != toNss.db()) {
-                sharding_ddl_util::checkDbPrimariesOnTheSameShard(opCtx, fromNss, toNss);
-            }
-
             validateNamespacesForRenameCollection(opCtx, fromNss, toNss);
 
             auto coordinatorDoc = RenameCollectionCoordinatorDocument();
             coordinatorDoc.setRenameCollectionRequest(req.getRenameCollectionRequest());
             coordinatorDoc.setShardingDDLCoordinatorMetadata(
                 {{fromNss, DDLCoordinatorTypeEnum::kRenameCollection}});
+            coordinatorDoc.setAllowEncryptedCollectionRename(
+                req.getAllowEncryptedCollectionRename().value_or(false));
+
             auto service = ShardingDDLCoordinatorService::getService(opCtx);
             auto renameCollectionCoordinator = checked_pointer_cast<RenameCollectionCoordinator>(
                 service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));

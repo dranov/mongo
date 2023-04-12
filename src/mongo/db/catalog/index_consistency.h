@@ -108,7 +108,8 @@ public:
     void addDocKey(OperationContext* opCtx,
                    const KeyString::Value& ks,
                    IndexInfo* indexInfo,
-                   RecordId recordId);
+                   RecordId recordId,
+                   ValidateResults* results);
 
     /**
      * During the first phase of validation, given the index entry's KeyString, decrement the
@@ -168,7 +169,7 @@ public:
      * Records the errors gathered from the second phase of index validation into the provided
      * ValidateResultsMap and ValidateResults.
      */
-    void addIndexEntryErrors(ValidateResults* results);
+    void addIndexEntryErrors(OperationContext* opCtx, ValidateResults* results);
 
     /**
      * Sets up this IndexConsistency object to limit memory usage in the second phase of index
@@ -179,8 +180,8 @@ public:
 
 private:
     struct IndexKeyBucket {
-        uint32_t indexKeyCount;
-        uint32_t bucketSizeBytes;
+        uint32_t indexKeyCount = 0;
+        uint32_t bucketSizeBytes = 0;
     };
 
     IndexConsistency() = delete;
@@ -241,5 +242,11 @@ private:
      */
     uint32_t _hashKeyString(const KeyString::Value& ks, uint32_t indexNameHash) const;
 
+    /**
+     * Prints the collection document's and index entry's metadata.
+     */
+    void _printMetadata(OperationContext* opCtx,
+                        ValidateResults* results,
+                        const IndexEntryInfo& info);
 };  // IndexConsistency
 }  // namespace mongo

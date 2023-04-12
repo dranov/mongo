@@ -88,6 +88,7 @@ const StringDataSet Document::allMetadataFieldNames{Document::metaFieldTextScore
                                                     Document::metaFieldGeoNearPoint,
                                                     Document::metaFieldSearchScore,
                                                     Document::metaFieldSearchHighlights,
+                                                    Document::metaFieldSearchSortValues,
                                                     Document::metaFieldIndexKey,
                                                     Document::metaFieldSearchScoreDetails};
 
@@ -373,6 +374,7 @@ intrusive_ptr<DocumentStorage> DocumentStorage::clone() const {
 
     out->_haveLazyLoadedMetadata = _haveLazyLoadedMetadata;
     out->_metadataFields = _metadataFields;
+    out->_snapshottedSize = _snapshottedSize;
 
     return out;
 }
@@ -394,6 +396,7 @@ void DocumentStorage::reset(const BSONObj& bson, bool stripMetadata) {
     _numBytesFromBSONInCache = 0;
     _stripMetadata = stripMetadata;
     _modified = false;
+    _snapshottedSize = 0;
 
     // Clean cache.
     for (auto it = iteratorCacheOnly(); !it.atEnd(); it.advance()) {
@@ -460,6 +463,8 @@ void DocumentStorage::loadLazyMetadata() const {
                 _metadataFields.setIndexKey(elem.Obj());
             } else if (fieldName == Document::metaFieldSearchScoreDetails) {
                 _metadataFields.setSearchScoreDetails(elem.Obj());
+            } else if (fieldName == Document::metaFieldSearchSortValues) {
+                _metadataFields.setSearchSortValues(elem.Obj());
             }
         }
     }
@@ -539,6 +544,7 @@ constexpr StringData Document::metaFieldGeoNearPoint;
 constexpr StringData Document::metaFieldSearchScore;
 constexpr StringData Document::metaFieldSearchHighlights;
 constexpr StringData Document::metaFieldSearchScoreDetails;
+constexpr StringData Document::metaFieldSearchSortValues;
 
 BSONObj Document::toBsonWithMetaData() const {
     BSONObjBuilder bb;
@@ -567,6 +573,9 @@ BSONObj Document::toBsonWithMetaData() const {
         bb.append(metaFieldIndexKey, metadata().getIndexKey());
     if (metadata().hasSearchScoreDetails())
         bb.append(metaFieldSearchScoreDetails, metadata().getSearchScoreDetails());
+    if (metadata().hasSearchSortValues()) {
+        bb.append(metaFieldSearchSortValues, metadata().getSearchSortValues());
+    }
     return bb.obj();
 }
 
@@ -704,31 +713,17 @@ const Value Document::getNestedField(const FieldPath& path, vector<Position>* po
     return getNestedFieldHelper(*this, path, positions, 0);
 }
 
-size_t Document::getApproximateSizeWithoutBackingBSON() const {
-    size_t size = sizeof(Document);
-    if (!_storage)
-        return size;
-
-    size += sizeof(DocumentStorage);
-    size += storage().allocatedBytes();
-
-    for (auto it = storage().iteratorCacheOnly(); !it.atEnd(); it.advance()) {
-        size += it->val.getApproximateSize();
-        size -= sizeof(Value);  // already accounted for above
-    }
-
-    // The metadata also occupies space in the document storage that's pre-allocated.
-    size += storage().getMetadataApproximateSize();
-
-    return size;
+size_t Document::getApproximateSize() const {
+    return sizeof(Document) + storage().snapshottedApproximateSize();
 }
 
-size_t Document::getApproximateSize() const {
-    return getApproximateSizeWithoutBackingBSON() + storage().bsonObjSize();
+size_t Document::getCurrentApproximateSize() const {
+    return sizeof(Document) + storage().currentApproximateSize();
 }
 
 size_t Document::memUsageForSorter() const {
-    return getApproximateSizeWithoutBackingBSON() + storage().nonCachedBsonObjSize();
+    return storage().currentApproximateSize() - storage().bsonObjSize() +
+        storage().nonCachedBsonObjSize();
 }
 
 void Document::hash_combine(size_t& seed,

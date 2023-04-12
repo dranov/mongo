@@ -11,7 +11,21 @@
 "use strict";
 load("jstests/libs/api_version_helpers.js");  // For 'APIVersionHelpers'.
 
+function isFeatureFlagEnabled(featureFlag) {
+    const featureFlagParam = db.adminCommand({getParameter: 1, [featureFlag]: 1});
+    return featureFlagParam.hasOwnProperty(featureFlag) && featureFlagParam[featureFlag]["value"];
+}
+
+// Since parallel test suite ignores feature flags in some scenarios we need explicitly check if the
+// required flag is enabled.
+if (!isFeatureFlagEnabled('featureFlagExactTopNAccumulator')) {
+    jsTestLog(
+        "Skipping the test because required feature flag 'featureFlagExactTopNAccumulator' is disabled");
+    return;
+}
+
 const collName = "api_version_new_52_language_features";
+const viewName = collName + "_view";
 const coll = db[collName];
 coll.drop();
 assert.commandWorked(coll.insert({a: 1, arr: [2, 1, 4]}));
@@ -83,7 +97,7 @@ for (const pipeline of stablePipelines) {
     APIVersionHelpers.assertAggregateSucceedsWithAPIStrict(pipeline, collName);
 
     // Assert creating a view on a pipeline with stages in API Version 1 succeeds.
-    APIVersionHelpers.assertViewSucceedsWithAPIStrict(pipeline, collName);
+    APIVersionHelpers.assertViewSucceedsWithAPIStrict(pipeline, viewName, collName);
 
     // Assert error is not thrown when running without apiStrict=true.
     assert.commandWorked(db.runCommand({

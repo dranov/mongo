@@ -70,7 +70,7 @@ BUILD_LOGGER_APPEND_GLOBAL_LOGS_ENDPOINT = "/build/%(build_id)s"
 BUILD_LOGGER_CREATE_TEST_ENDPOINT = "/build/%(build_id)s/test"
 BUILD_LOGGER_APPEND_TEST_LOGS_ENDPOINT = "/build/%(build_id)s/test/%(test_id)s"
 
-BUILD_LOGGER_DEFAULT_URL = "https://logkeeper.mongodb.org"
+BUILD_LOGGER_DEFAULT_URL = "https://logkeeper2.build.10gen.cc"
 BUILD_LOGGER_TIMEOUT_SECS = 65
 
 LOCAL_REPORTS_DIR = "bd_reports"
@@ -86,7 +86,7 @@ THIRD_PARTY_COMPONENTS_FILE = "etc/third_party_components.yml"
 
 ############################################################################
 
-RE_LETTERS = re.compile("[A-Za-z]{2,}")
+RE_LETTER = re.compile("[A-Za-z]")
 
 
 def default_if_none(value, default):
@@ -331,8 +331,9 @@ class VersionInfo:
             if self.ver_str.endswith('-'):
                 self.ver_str = self.ver_str[0:-1]
 
-            # Boost keeps varying the version strings so filter for anything with 2 or more ascii charaters
-            if RE_LETTERS.search(self.ver_str):
+            # Boost keeps varying the version strings so filter for anything with a letter
+            # Safeint has "3.0.26c" as a version number
+            if RE_LETTER.search(self.ver_str):
                 self.production_version = False
                 return
 
@@ -558,8 +559,7 @@ class BlackDuckConfig:
             rc = json.loads(rfh.read())
 
         self.url = rc["baseurl"]
-        self.username = rc["username"]
-        self.password = rc["password"]
+        self.token = rc["token"]
 
 
 def _run_scan():
@@ -568,7 +568,7 @@ def _run_scan():
 
     with tempfile.NamedTemporaryFile() as fp:
         fp.write(f"""#/!bin/sh
-curl --retry 5 -s -L https://detect.synopsys.com/detect.sh  | bash -s -- --blackduck.url={bdc.url} --blackduck.username={bdc.username} --blackduck.password={bdc.password} --detect.report.timeout={BLACKDUCK_TIMEOUT_SECS} --snippet-matching --upload-source --detect.wait.for.results=true
+curl --retry 5 -s -L https://detect.synopsys.com/detect8.sh | bash -s -- --blackduck.url={bdc.url} --blackduck.api.token={bdc.token} --detect.report.timeout={BLACKDUCK_TIMEOUT_SECS} --snippet-matching --upload-source --detect.wait.for.results=true --logging.level.detect=TRACE --detect.diagnostic=true --detect.cleanup=false
 """.encode())
         fp.flush()
 

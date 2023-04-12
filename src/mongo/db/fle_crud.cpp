@@ -41,7 +41,9 @@
 #include "mongo/crypto/encryption_fields_gen.h"
 #include "mongo/crypto/fle_crypto.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_time_tracker.h"
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/ops/write_ops_parsers.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
@@ -112,7 +114,8 @@ void replyToResponse(OperationContext* opCtx,
     // committed. The Transaction API propagates the OpTime from the commit transaction onto the
     // current thread so grab it from TLS and change the OpTime on the reply.
     //
-    response->setLastOp(repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp());
+    response->setLastOp({OperationTimeTracker::get(opCtx)->getMaxOperationTime().asTimestamp(),
+                         repl::OpTime::kUninitializedTerm});
 }
 
 void responseToReply(const BatchedCommandResponse& response,
@@ -1280,12 +1283,10 @@ uint64_t FLEQueryInterfaceImpl::countDocuments(const NamespaceString& nss) {
     CountCommandRequest ccr(nss);
     auto opMsgRequest = ccr.serialize(BSONObj());
 
-    auto requestMessage = opMsgRequest.serialize();
+    DBDirectClient directClient(opCtx.get());
+    auto uniqueReply = directClient.runCommand(opMsgRequest);
 
-    auto serviceEntryPoint = opCtx->getServiceContext()->getServiceEntryPoint();
-    DbResponse dbResponse = serviceEntryPoint->handleRequest(opCtx.get(), requestMessage).get();
-
-    auto reply = rpc::makeReply(&dbResponse.response)->getCommandReply().getOwned();
+    auto reply = uniqueReply->getCommandReply();
 
     auto status = getStatusFromWriteCommandReply(reply);
     uassertStatusOK(status);

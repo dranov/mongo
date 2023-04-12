@@ -74,7 +74,6 @@
 #include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
@@ -86,7 +85,6 @@
 #include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/ftdc/util.h"
 #include "mongo/db/global_settings.h"
-#include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/initialize_server_global_state.h"
@@ -349,6 +347,11 @@ void registerPrimaryOnlyServices(ServiceContext* serviceContext) {
 
 MONGO_FAIL_POINT_DEFINE(shutdownAtStartup);
 
+// Important:
+// _initAndListen among its other tasks initializes the storage subsystem.
+// File Copy Based Initial Sync will restart the storage subsystem and may need to repeat some
+// of the initialization steps within.  If you add or change any of these steps, make sure
+// any necessary changes are also made to File Copy Based Initial Sync.
 ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     Client::initThread("initandlisten");
 
@@ -1015,7 +1018,6 @@ void setUpCollectionShardingState(ServiceContext* serviceContext) {
 
 void setUpCatalog(ServiceContext* serviceContext) {
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
-    IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
     Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
 }
 

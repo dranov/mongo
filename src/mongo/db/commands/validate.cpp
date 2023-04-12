@@ -35,11 +35,13 @@
 #include "mongo/db/catalog/collection_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/testing_proctor.h"
 
 namespace mongo {
 
@@ -60,6 +62,79 @@ std::set<std::string> _validationsInProgress;
 // namespace, as _validationsInProgress would indicate. This is signaled when a validation command
 // finishes on any namespace.
 stdx::condition_variable _validationNotifier;
+
+/**
+ * Creates an aggregation command with a $collStats pipeline that fetches 'storageStats' and
+ * 'count'.
+ */
+BSONObj makeCollStatsCommand(StringData collectionNameOnly) {
+    BSONArrayBuilder pipelineBuilder;
+    pipelineBuilder << BSON("$collStats"
+                            << BSON("storageStats" << BSONObj() << "count" << BSONObj()));
+    return BSON("aggregate" << collectionNameOnly << "pipeline" << pipelineBuilder.arr() << "cursor"
+                            << BSONObj());
+}
+
+/**
+ * $collStats never returns more than a single document. If that ever changes in future, validate
+ * must invariant so that the handling can be updated, but only invariant in testing environments,
+ * never invariant because of debug logging in production situations.
+ */
+void verifyCommandResponse(const BSONObj& collStatsResult) {
+    if (TestingProctor::instance().isEnabled()) {
+        invariant(
+            !collStatsResult.getObjectField("cursor").isEmpty() &&
+                !collStatsResult.getObjectField("cursor").getObjectField("firstBatch").isEmpty(),
+            str::stream() << "Expected a cursor to be present in the $collStats results: "
+                          << collStatsResult.toString());
+        invariant(collStatsResult.getObjectField("cursor").getIntField("id") == 0,
+                  str::stream() << "Expected cursor ID to be 0: " << collStatsResult.toString());
+    } else {
+        uassert(
+            7463202,
+            str::stream() << "Expected a cursor to be present in the $collStats results: "
+                          << collStatsResult.toString(),
+            !collStatsResult.getObjectField("cursor").isEmpty() &&
+                !collStatsResult.getObjectField("cursor").getObjectField("firstBatch").isEmpty());
+        uassert(7463203,
+                str::stream() << "Expected cursor ID to be 0: " << collStatsResult.toString(),
+                collStatsResult.getObjectField("cursor").getIntField("id") == 0);
+    }
+}
+
+/**
+ * Log the $collStats results for 'nss' to provide additional debug information for validation
+ * failures.
+ */
+void logCollStats(OperationContext* opCtx, const NamespaceString& nss) {
+    DBDirectClient client(opCtx);
+
+    BSONObj collStatsResult;
+    try {
+        // Run $collStats via aggregation.
+        client.runCommand(nss.db().toString(),
+                          makeCollStatsCommand(nss.coll()),
+                          collStatsResult /* command return results */);
+        // Logging $collStats information is best effort. If the collection doesn't exist, for
+        // example, then the $collStats query will fail and the failure reason will be logged.
+        uassertStatusOK(getStatusFromWriteCommandReply(collStatsResult));
+        verifyCommandResponse(collStatsResult);
+
+        LOGV2_OPTIONS(7463200,
+                      logv2::LogTruncation::Disabled,
+                      "Corrupt namespace $collStats results",
+                      "namespace"_attr = nss,
+                      "collStats"_attr =
+                          collStatsResult.getObjectField("cursor").getObjectField("firstBatch"));
+    } catch (const DBException& ex) {
+        // Catch the error so that the validate error does not get overwritten by the attempt to add
+        // debug logging.
+        LOGV2_WARNING(7463201,
+                      "Failed to fetch $collStats for validation error",
+                      "namespace"_attr = nss,
+                      "error"_attr = ex.toStatus());
+    }
+}
 
 }  // namespace
 
@@ -123,6 +198,7 @@ public:
 
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
         bool background = cmdObj["background"].trueValue();
+        bool logDiagnostics = cmdObj["logDiagnostics"].trueValue();
 
         // Background validation is not supported on the ephemeralForTest storage engine due to its
         // lack of support for timestamps. Switch the mode to foreground validation instead.
@@ -255,8 +331,8 @@ public:
         }
 
         ValidateResults validateResults;
-        Status status =
-            CollectionValidation::validate(opCtx, nss, mode, repairMode, &validateResults, &result);
+        Status status = CollectionValidation::validate(
+            opCtx, nss, mode, repairMode, &validateResults, &result, logDiagnostics);
         if (!status.isOK()) {
             return CommandHelpers::appendCommandStatusNoThrow(result, status);
         }
@@ -267,6 +343,7 @@ public:
             result.append("advice",
                           "A corrupt namespace has been detected. See "
                           "http://dochub.mongodb.org/core/data-recovery for recovery steps.");
+            logCollStats(opCtx, nss);
         }
 
         return true;

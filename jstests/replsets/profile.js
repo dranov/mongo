@@ -1,7 +1,11 @@
 // Confirm that implicitly created profile collections are successful and do not trigger assertions.
 // In order to implicitly create a profile collection with a read, we must set up the server with
 // some data to read without the profiler being active.
-// @tags: [requires_persistence]
+// @tags: [
+//     # 'assert' log component is not available in 5.0.
+//     requires_fcv_60,
+//     requires_persistence,
+// ]
 (function() {
 "use strict";
 let rst = new ReplSetTest({nodes: {n0: {profile: "0"}}});
@@ -20,12 +24,22 @@ primary = rst.getPrimary();
 primaryDB = primary.getDB('test');
 
 let oldAssertCounts = primaryDB.serverStatus().asserts;
-assert.eq(0, primaryDB.system.profile.count());
-assert.eq([{_id: 1}], primaryDB.foo.aggregate([]).toArray());
-let newAssertCounts = primaryDB.serverStatus().asserts;
-assert.eq(oldAssertCounts, newAssertCounts);
-// Should have 2 entries, one for the count command and one for the aggregate command.
-assert.eq(2, primaryDB.system.profile.count());
+jsTestLog('Before running aggregation: Assert counts reported by db.serverStatus(): ' +
+          tojson(oldAssertCounts));
+primaryDB.setLogLevel(1, 'assert');
+try {
+    assert.eq(0, primaryDB.system.profile.count());
+    assert.eq([{_id: 1}], primaryDB.foo.aggregate([]).toArray());
+
+    let newAssertCounts = primaryDB.serverStatus().asserts;
+    jsTestLog('After running aggregation: Assert counts reported by db.serverStatus(): ' +
+              tojson(newAssertCounts));
+    assert.eq(oldAssertCounts, newAssertCounts);
+    // Should have 2 entries, one for the count command and one for the aggregate command.
+    assert.eq(2, primaryDB.system.profile.count());
+} finally {
+    primaryDB.setLogLevel(0, 'assert');
+}
 
 rst.stopSet();
 })();

@@ -10,6 +10,7 @@
 'use strict';
 load("jstests/replsets/rslib.js");
 load("jstests/sharding/libs/find_chunks_util.js");
+load("jstests/libs/feature_flag_util.js");
 
 // Replica set nodes started with --shardsvr do not enable key generation until they are added
 // to a sharded cluster and reject commands with gossiped clusterTime from users without the
@@ -174,25 +175,32 @@ awaitRSClientHosts(s.s, d2.nodes, {ok: true});
 
 s.getDB("test").foo.remove({});
 
-var num = 10000;
+var num = 10;
 assert.commandWorked(s.s.adminCommand({split: "test.foo", middle: {x: num / 2}}));
+const bigString = 'X'.repeat(1024 * 1024);  // 1MB
 var bulk = s.getDB("test").foo.initializeUnorderedBulkOp();
 for (i = 0; i < num; i++) {
-    bulk.insert({_id: i, x: i, abc: "defg", date: new Date(), str: "all the talk on the market"});
+    bulk.insert({_id: i, x: i, abc: "defg", date: new Date(), str: bigString});
 }
 assert.commandWorked(bulk.execute());
 
 s.startBalancer(60000);
 
-assert.soon(function() {
-    var d1Chunks = findChunksUtil.countChunksForNs(s.getDB("config"), 'test.foo', {shard: "d1"});
-    var d2Chunks = findChunksUtil.countChunksForNs(s.getDB("config"), 'test.foo', {shard: "d2"});
-    var totalChunks = findChunksUtil.countChunksForNs(s.getDB("config"), 'test.foo');
+const balanceAccordingToDataSize =
+    FeatureFlagUtil.isEnabled(s.getDB('admin'), "BalanceAccordingToDataSize");
+if (!balanceAccordingToDataSize) {
+    assert.soon(function() {
+        var d1Chunks =
+            findChunksUtil.countChunksForNs(s.getDB("config"), 'test.foo', {shard: "d1"});
+        var d2Chunks =
+            findChunksUtil.countChunksForNs(s.getDB("config"), 'test.foo', {shard: "d2"});
+        var totalChunks = findChunksUtil.countChunksForNs(s.getDB("config"), 'test.foo');
 
-    print("chunks: " + d1Chunks + " " + d2Chunks + " " + totalChunks);
+        print("chunks: " + d1Chunks + " " + d2Chunks + " " + totalChunks);
 
-    return d1Chunks > 0 && d2Chunks > 0 && (d1Chunks + d2Chunks == totalChunks);
-}, "Chunks failed to balance", 60000, 5000);
+        return d1Chunks > 0 && d2Chunks > 0 && (d1Chunks + d2Chunks == totalChunks);
+    }, "Chunks failed to balance", 60000, 5000);
+}
 
 // SERVER-33753: count() without predicate can be wrong on sharded collections.
 // assert.eq(s.getDB("test").foo.count(), num+1);
@@ -234,7 +242,7 @@ if (numDocs != num) {
 // This call also waits for any ongoing balancing to stop
 s.stopBalancer(60000);
 
-var cursor = s.getDB("test").foo.find({x: {$lt: 500}});
+var cursor = s.getDB("test").foo.find({x: {$lt: 5}});
 
 var count = 0;
 while (cursor.hasNext()) {
@@ -242,7 +250,7 @@ while (cursor.hasNext()) {
     count++;
 }
 
-assert.eq(count, 500);
+assert.eq(count, 5);
 
 logout(adminUser);
 

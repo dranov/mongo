@@ -184,6 +184,7 @@ const std::string DataSizeCommandInfo::kKeyPattern = "keyPattern";
 const std::string DataSizeCommandInfo::kMinValue = "min";
 const std::string DataSizeCommandInfo::kMaxValue = "max";
 const std::string DataSizeCommandInfo::kEstimatedValue = "estimate";
+const std::string DataSizeCommandInfo::kMaxSizeValue = "maxSize";
 
 const std::string SplitChunkCommandInfo::kCommandName = "splitChunk";
 const std::string SplitChunkCommandInfo::kShardName = "from";
@@ -255,11 +256,12 @@ SemiFuture<void> BalancerCommandsSchedulerImpl::requestMoveChunk(
     auto externalClientInfo =
         issuedByRemoteUser ? boost::optional<ExternalClientInfo>(opCtx) : boost::none;
 
+    invariant(migrateInfo.maxKey.has_value(), "Bound not present when requesting move chunk");
     auto commandInfo = std::make_shared<MoveChunkCommandInfo>(migrateInfo.nss,
                                                               migrateInfo.from,
                                                               migrateInfo.to,
                                                               migrateInfo.minKey,
-                                                              migrateInfo.maxKey,
+                                                              *migrateInfo.maxKey,
                                                               commandSettings.maxChunkSizeBytes,
                                                               commandSettings.secondaryThrottle,
                                                               commandSettings.waitForDelete,
@@ -358,13 +360,15 @@ SemiFuture<DataSizeResponse> BalancerCommandsSchedulerImpl::requestDataSize(
     const ChunkRange& chunkRange,
     const ChunkVersion& version,
     const KeyPattern& keyPattern,
-    bool estimatedValue) {
+    bool estimatedValue,
+    int64_t maxSize) {
     auto commandInfo = std::make_shared<DataSizeCommandInfo>(nss,
                                                              shardId,
                                                              keyPattern.toBSON(),
                                                              chunkRange.getMin(),
                                                              chunkRange.getMax(),
                                                              estimatedValue,
+                                                             maxSize,
                                                              version);
 
     return _buildAndEnqueueNewRequest(opCtx, std::move(commandInfo))
@@ -376,7 +380,8 @@ SemiFuture<DataSizeResponse> BalancerCommandsSchedulerImpl::requestDataSize(
             }
             long long sizeBytes = remoteResponse.data["size"].number();
             long long numObjects = remoteResponse.data["numObjects"].number();
-            return DataSizeResponse(sizeBytes, numObjects);
+            bool maxSizeReached = remoteResponse.data["maxReached"].trueValue();
+            return DataSizeResponse(sizeBytes, numObjects, maxSizeReached);
         })
         .semi();
 }
@@ -422,49 +427,53 @@ CommandSubmissionResult BalancerCommandsSchedulerImpl::_submit(
     LOGV2_DEBUG(
         5847203, 2, "Balancer command request submitted for execution", "reqId"_attr = params.id);
     bool distLockTaken = false;
-
-    const auto shardWithStatus =
-        Grid::get(opCtx)->shardRegistry()->getShard(opCtx, params.commandInfo->getTarget());
-    if (!shardWithStatus.isOK()) {
-        return CommandSubmissionResult(params.id, distLockTaken, shardWithStatus.getStatus());
-    }
-
-    const auto shardHostWithStatus = shardWithStatus.getValue()->getTargeter()->findHost(
-        opCtx, ReadPreferenceSetting{ReadPreference::PrimaryOnly});
-    if (!shardHostWithStatus.isOK()) {
-        return CommandSubmissionResult(params.id, distLockTaken, shardHostWithStatus.getStatus());
-    }
-
-    if (params.commandInfo->requiresRecoveryOnCrash()) {
-        auto writeStatus = persistRecoveryInfo(opCtx, *(params.commandInfo));
-        if (!writeStatus.isOK()) {
-            return CommandSubmissionResult(params.id, distLockTaken, writeStatus);
+    try {
+        const auto shardWithStatus =
+            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, params.commandInfo->getTarget());
+        if (!shardWithStatus.isOK()) {
+            return CommandSubmissionResult(params.id, distLockTaken, shardWithStatus.getStatus());
         }
-    }
 
-    const executor::RemoteCommandRequest remoteCommand =
-        executor::RemoteCommandRequest(shardHostWithStatus.getValue(),
-                                       params.commandInfo->getTargetDb(),
-                                       params.commandInfo->serialise(),
-                                       opCtx);
-    auto onRemoteResponseReceived =
-        [this,
-         requestId = params.id](const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
-            _applyCommandResponse(requestId, args.response);
-        };
-
-    if (params.commandInfo->requiresDistributedLock()) {
-        Status lockAcquisitionResponse =
-            _distributedLocks.acquireFor(opCtx, params.commandInfo->getNameSpace());
-        if (!lockAcquisitionResponse.isOK()) {
-            return CommandSubmissionResult(params.id, distLockTaken, lockAcquisitionResponse);
+        const auto shardHostWithStatus = shardWithStatus.getValue()->getTargeter()->findHost(
+            opCtx, ReadPreferenceSetting{ReadPreference::PrimaryOnly});
+        if (!shardHostWithStatus.isOK()) {
+            return CommandSubmissionResult(
+                params.id, distLockTaken, shardHostWithStatus.getStatus());
         }
-        distLockTaken = true;
-    }
 
-    auto swRemoteCommandHandle =
-        (*_executor)->scheduleRemoteCommand(remoteCommand, onRemoteResponseReceived);
-    return CommandSubmissionResult(params.id, distLockTaken, swRemoteCommandHandle.getStatus());
+        if (params.commandInfo->requiresRecoveryOnCrash()) {
+            auto writeStatus = persistRecoveryInfo(opCtx, *(params.commandInfo));
+            if (!writeStatus.isOK()) {
+                return CommandSubmissionResult(params.id, distLockTaken, writeStatus);
+            }
+        }
+
+        const executor::RemoteCommandRequest remoteCommand =
+            executor::RemoteCommandRequest(shardHostWithStatus.getValue(),
+                                           params.commandInfo->getTargetDb(),
+                                           params.commandInfo->serialise(),
+                                           opCtx);
+        auto onRemoteResponseReceived =
+            [this,
+             requestId = params.id](const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
+                _applyCommandResponse(requestId, args.response);
+            };
+
+        if (params.commandInfo->requiresDistributedLock()) {
+            Status lockAcquisitionResponse =
+                _distributedLocks.acquireFor(opCtx, params.commandInfo->getNameSpace());
+            if (!lockAcquisitionResponse.isOK()) {
+                return CommandSubmissionResult(params.id, distLockTaken, lockAcquisitionResponse);
+            }
+            distLockTaken = true;
+        }
+
+        auto swRemoteCommandHandle =
+            (*_executor)->scheduleRemoteCommand(remoteCommand, onRemoteResponseReceived);
+        return CommandSubmissionResult(params.id, distLockTaken, swRemoteCommandHandle.getStatus());
+    } catch (const DBException& e) {
+        return CommandSubmissionResult(params.id, distLockTaken, e.toStatus());
+    }
 }
 
 void BalancerCommandsSchedulerImpl::_applySubmissionResult(

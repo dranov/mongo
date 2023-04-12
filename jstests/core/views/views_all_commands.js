@@ -541,7 +541,6 @@ let viewsCommandTests = {
             skipSharded: true,
         }
     ],
-    repairDatabase: {skip: isUnrelated},
     repairShardedCollectionChunksHistory: {
         command: {repairShardedCollectionChunksHistory: "test.view"},
         skipStandalone: true,
@@ -605,6 +604,7 @@ let viewsCommandTests = {
     rotateCertificates: {skip: isUnrelated},
     saslContinue: {skip: isUnrelated},
     saslStart: {skip: isUnrelated},
+    sbe: {skip: isAnInternalCommand},
     serverStatus: {command: {serverStatus: 1}, skip: isUnrelated},
     setChangeStreamOptions: {skip: isUnrelated},  // TODO SERVER-65353 remove in 6.1.
     setIndexCommitQuorum: {skip: isUnrelated},
@@ -613,6 +613,7 @@ let viewsCommandTests = {
     setDefaultRWConcern: {skip: isUnrelated},
     setFeatureCompatibilityVersion: {skip: isUnrelated},
     setFreeMonitoring: {skip: isUnrelated},
+    setProfilingFilterGlobally: {skip: isUnrelated},
     setParameter: {skip: isUnrelated},
     setShardVersion: {skip: isUnrelated},
     setClusterParameter: {skip: isUnrelated},

@@ -5,7 +5,7 @@
  *  # Cannot implicitly shard accessed collections because of collection existing when none
  *  # expected.
  *  assumes_no_implicit_collection_creation_after_drop,  # common tag in collMod tests.
- *  requires_fcv_52,
+ *  requires_fcv_60,
  *  requires_non_retryable_commands, # common tag in collMod tests.
  *  # TODO(SERVER-61181): Fix validation errors under ephemeralForTest.
  *  incompatible_with_eft,
@@ -19,12 +19,9 @@
 (function() {
 'use strict';
 
-const collModIndexUniqueEnabled = assert
-                                      .commandWorked(db.getMongo().adminCommand(
-                                          {getParameter: 1, featureFlagCollModIndexUnique: 1}))
-                                      .featureFlagCollModIndexUnique.value;
+load("jstests/libs/feature_flag_util.js");
 
-if (!collModIndexUniqueEnabled) {
+if (!FeatureFlagUtil.isEnabled(db, "CollModIndexUnique")) {
     jsTestLog('Skipping test because the collMod unique index feature flag is disabled.');
     return;
 }

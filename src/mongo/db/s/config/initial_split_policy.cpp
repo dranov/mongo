@@ -37,12 +37,14 @@
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/process_interface/shardsvr_process_interface.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/s/balancer/balancer_policy.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/vector_clock.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/grid.h"
@@ -54,6 +56,7 @@ namespace {
 
 using ChunkDistributionMap = stdx::unordered_map<ShardId, size_t>;
 using ZoneShardMap = StringMap<std::vector<ShardId>>;
+using boost::intrusive_ptr;
 
 std::vector<ShardId> getAllShardIdsSorted(OperationContext* opCtx) {
     // Many tests assume that chunks will be placed on shards
@@ -266,7 +269,8 @@ std::unique_ptr<InitialSplitPolicy> InitialSplitPolicy::calculateOptimizationStr
     const boost::optional<std::vector<BSONObj>>& initialSplitPoints,
     const std::vector<TagsType>& tags,
     size_t numShards,
-    bool collectionIsEmpty) {
+    bool collectionIsEmpty,
+    bool useAutoSplitter) {
     uassert(ErrorCodes::InvalidOptions,
             str::stream() << "numInitialChunks is only supported when the collection is empty "
                              "and has a hashed field in the shard key pattern",
@@ -310,7 +314,11 @@ std::unique_ptr<InitialSplitPolicy> InitialSplitPolicy::calculateOptimizationStr
         return std::make_unique<SingleChunkOnPrimarySplitPolicy>();
     }
 
-    return std::make_unique<UnoptimizedSplitPolicy>();
+    if (useAutoSplitter) {
+        return std::make_unique<AutoSplitInChunksOnPrimaryPolicy>();
+    }
+
+    return std::make_unique<SingleChunkOnPrimarySplitPolicy>();
 }
 
 InitialSplitPolicy::ShardCollectionConfig SingleChunkOnPrimarySplitPolicy::createFirstChunks(
@@ -334,7 +342,7 @@ InitialSplitPolicy::ShardCollectionConfig SingleChunkOnPrimarySplitPolicy::creat
     return {std::move(chunks)};
 }
 
-InitialSplitPolicy::ShardCollectionConfig UnoptimizedSplitPolicy::createFirstChunks(
+InitialSplitPolicy::ShardCollectionConfig AutoSplitInChunksOnPrimaryPolicy::createFirstChunks(
     OperationContext* opCtx,
     const ShardKeyPattern& shardKeyPattern,
     const SplitPolicyParams& params) {
@@ -650,34 +658,29 @@ std::vector<BSONObj> ReshardingSplitPolicy::createRawPipeline(const ShardKeyPatt
 
     std::vector<BSONObj> res;
     const auto& shardKeyFields = shardKey.getKeyPatternFields();
-
-    BSONObjBuilder projectValBuilder;
     BSONObjBuilder sortValBuilder;
-
+    using Doc = Document;
+    using Arr = std::vector<Value>;
+    using V = Value;
+    Arr arrayToObjectBuilder;
     for (auto&& fieldRef : shardKeyFields) {
         // If the shard key includes a hashed field and current fieldRef is the hashed field.
         if (shardKey.isHashedPattern() &&
             fieldRef->dottedField().compare(shardKey.getHashedField().fieldNameStringData()) == 0) {
-            projectValBuilder.append(fieldRef->dottedField(),
-                                     BSON("$toHashedIndexKey"
-                                          << "$" + fieldRef->dottedField()));
+            arrayToObjectBuilder.emplace_back(
+                Doc{{"k", V{fieldRef->dottedField()}},
+                    {"v", Doc{{"$toHashedIndexKey", V{"$" + fieldRef->dottedField()}}}}});
         } else {
-            projectValBuilder.append(
-                str::stream() << fieldRef->dottedField(),
-                BSON("$ifNull" << BSON_ARRAY("$" + fieldRef->dottedField() << BSONNULL)));
+            arrayToObjectBuilder.emplace_back(Doc{
+                {"k", V{fieldRef->dottedField()}},
+                {"v", Doc{{"$ifNull", V{Arr{V{"$" + fieldRef->dottedField()}, V{BSONNULL}}}}}}});
         }
-
         sortValBuilder.append(fieldRef->dottedField().toString(), 1);
     }
-
-    // Do not project _id if it's not part of the shard key.
-    if (!shardKey.hasId()) {
-        projectValBuilder.append("_id", 0);
-    }
-
     res.push_back(BSON("$sample" << BSON("size" << numSplitPoints * samplesPerChunk)));
-    res.push_back(BSON("$project" << projectValBuilder.obj()));
     res.push_back(BSON("$sort" << sortValBuilder.obj()));
+    res.push_back(
+        Doc{{"$replaceWith", Doc{{"$arrayToObject", Arr{V{arrayToObjectBuilder}}}}}}.toBson());
     return res;
 }
 
@@ -800,16 +803,24 @@ void ReshardingSplitPolicy::_appendSplitPointsFromSample(BSONObjSet* splitPoints
 
     while (nextKey && nRemaining > 0) {
         // if key is hashed, nextKey values are already hashed
-        auto result = splitPoints->insert(
-            dotted_path_support::extractElementsBasedOnTemplate(*nextKey, shardKey.toBSON())
-                .getOwned());
-
+        auto result = splitPoints->insert(nextKey->getOwned());
         if (result.second) {
             nRemaining--;
         }
-
         nextKey = _samples->getNext();
     }
+}
+
+std::unique_ptr<ReshardingSplitPolicy::SampleDocumentSource>
+ReshardingSplitPolicy::makePipelineDocumentSource_forTest(OperationContext* opCtx,
+                                                          const NamespaceString& ns,
+                                                          const ShardKeyPattern& shardKey,
+                                                          int numInitialChunks,
+                                                          int samplesPerChunk) {
+    MakePipelineOptions opts;
+    opts.attachCursorSource = false;
+    return _makePipelineDocumentSource(
+        opCtx, ns, shardKey, numInitialChunks, samplesPerChunk, std::move(opts));
 }
 
 std::unique_ptr<ReshardingSplitPolicy::SampleDocumentSource>
@@ -817,9 +828,9 @@ ReshardingSplitPolicy::_makePipelineDocumentSource(OperationContext* opCtx,
                                                    const NamespaceString& ns,
                                                    const ShardKeyPattern& shardKey,
                                                    int numInitialChunks,
-                                                   int samplesPerChunk) {
+                                                   int samplesPerChunk,
+                                                   MakePipelineOptions opts) {
     auto rawPipeline = createRawPipeline(shardKey, numInitialChunks - 1, samplesPerChunk);
-
     StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
     resolvedNamespaces[ns.coll()] = {ns, std::vector<BSONObj>{}};
 
@@ -833,7 +844,7 @@ ReshardingSplitPolicy::_makePipelineDocumentSource(OperationContext* opCtx,
                                                     boost::none, /* explain */
                                                     false,       /* fromMongos */
                                                     false,       /* needsMerge */
-                                                    false,       /* allowDiskUse */
+                                                    true,        /* allowDiskUse */
                                                     true,        /* bypassDocumentValidation */
                                                     false,       /* isMapReduceCommand */
                                                     ns,
@@ -843,8 +854,10 @@ ReshardingSplitPolicy::_makePipelineDocumentSource(OperationContext* opCtx,
                                                     std::move(resolvedNamespaces),
                                                     boost::none); /* collUUID */
 
-    return std::make_unique<PipelineDocumentSource>(Pipeline::makePipeline(rawPipeline, expCtx, {}),
-                                                    samplesPerChunk - 1);
+    expCtx->tempDir = storageGlobalParams.dbpath + "/tmp";
+
+    return std::make_unique<PipelineDocumentSource>(
+        Pipeline::makePipeline(rawPipeline, expCtx, opts), samplesPerChunk - 1);
 }
 
 ReshardingSplitPolicy::PipelineDocumentSource::PipelineDocumentSource(

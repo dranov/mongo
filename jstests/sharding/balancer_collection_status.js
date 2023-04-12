@@ -6,7 +6,6 @@
 'use strict';
 
 const chunkSizeMB = 1;
-
 let st = new ShardingTest({
     shards: 3,
     other: {
@@ -55,6 +54,10 @@ assert.eq(result.balancerCompliant, true);
 // get shardIds
 const shards = st.s0.getDB('config').shards.find().toArray();
 
+const bigString = 'X'.repeat(1024 * 1024);  // 1MB
+for (var i = 0; i < 30; i += 10) {
+    assert.commandWorked(st.s0.getDB('db').getCollection('col').insert({key: i, s: bigString}));
+}
 // manually split and place the 3 chunks on the same shard
 assert.commandWorked(st.s0.adminCommand({split: 'db.col', middle: {key: 10}}));
 assert.commandWorked(st.s0.adminCommand({split: 'db.col', middle: {key: 20}}));

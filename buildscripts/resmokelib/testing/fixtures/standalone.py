@@ -4,6 +4,8 @@ import os
 import os.path
 import time
 import shutil
+import uuid
+
 import yaml
 
 import pymongo
@@ -22,6 +24,9 @@ class MongoDFixture(interface.Fixture):
         interface.Fixture.__init__(self, logger, job_num, fixturelib, dbpath_prefix=dbpath_prefix)
         self.mongod_options = self.fixturelib.make_historic(
             self.fixturelib.default_if_none(mongod_options, {}))
+
+        if "set_parameters" not in self.mongod_options:
+            self.mongod_options["set_parameters"] = {}
 
         if add_feature_flags:
             for ff in self.config.ENABLED_FEATURE_FLAGS:
@@ -52,6 +57,11 @@ class MongoDFixture(interface.Fixture):
         self.port = port or fixturelib.get_next_port(job_num)
         self.mongod_options["port"] = self.port
 
+        # Always log backtraces to a file in the dbpath in our testing.
+        backtrace_log_file_name = os.path.join(self.get_dbpath_prefix(),
+                                               uuid.uuid4().hex + ".stacktrace")
+        self.mongod_options["set_parameters"]["backtraceLogFile"] = backtrace_log_file_name
+
     def setup(self):
         """Set up the mongod."""
         if not self.preserve_dbpath and os.path.lexists(self._dbpath):
@@ -61,7 +71,8 @@ class MongoDFixture(interface.Fixture):
 
         launcher = MongodLauncher(self.fixturelib)
         # Second return val is the port, which we ignore because we explicitly created the port above.
-        # The port is used to set other mongod_option's here: https://github.com/mongodb/mongo/blob/532a6a8ae7b8e7ab5939e900759c00794862963d/buildscripts/resmokelib/testing/fixtures/replicaset.py#L136
+        # The port is used to set other mongod_option's here:
+        # https://github.com/mongodb/mongo/blob/532a6a8ae7b8e7ab5939e900759c00794862963d/buildscripts/resmokelib/testing/fixtures/replicaset.py#L136
         mongod, _ = launcher.launch_mongod_program(self.logger, self.job_num,
                                                    executable=self.mongod_executable,
                                                    mongod_options=self.mongod_options)
@@ -168,7 +179,7 @@ class MongoDFixture(interface.Fixture):
 
     def get_driver_connection_url(self):
         """Return the driver connection URL."""
-        return "mongodb://" + self.get_internal_connection_string()
+        return "mongodb://" + self.get_internal_connection_string() + "/?directConnection=true"
 
 
 # The below parameters define the default 'logComponentVerbosity' object passed to mongod processes
@@ -180,15 +191,16 @@ class MongoDFixture(interface.Fixture):
 # The default verbosity setting for any tests that are not started with an Evergreen task id. This
 # will apply to any tests run locally.
 DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY = {
-    "replication": {"rollback": 2}, "sharding": {"migration": 2}, "transaction": 4,
-    "tenantMigration": 4
+    "replication": {"rollback": 2}, "sharding": {"migration": 2, "rangeDeleter": 2},
+    "transaction": 4, "tenantMigration": 4
 }
 
 # The default verbosity setting for any mongod processes running in Evergreen i.e. started with an
 # Evergreen task id.
 DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY = {
-    "replication": {"election": 4, "heartbeats": 2, "initialSync": 2, "rollback": 2},
-    "sharding": {"migration": 2}, "storage": {"recovery": 2}, "transaction": 4, "tenantMigration": 4
+    "replication": {"election": 4, "heartbeats": 2, "initialSync": 2,
+                    "rollback": 2}, "sharding": {"migration": 2, "rangeDeleter": 2},
+    "storage": {"recovery": 2}, "transaction": 4, "tenantMigration": 4
 }
 
 
@@ -292,6 +304,13 @@ class MongodLauncher(object):
                 "mode": "alwaysOn", "data": {"numTickets": self.config.FLOW_CONTROL_TICKETS}
             }
 
+        # The internalQueryForceClassicEngine parameter was renamed to
+        # internalQueryFrameworkControl starting in version 6.1.
+        if "internalQueryFrameworkControl" in suite_set_parameters and suite_set_parameters[
+                "internalQueryFrameworkControl"] == "forceClassicEngine":
+            del suite_set_parameters["internalQueryFrameworkControl"]
+            suite_set_parameters["internalQueryForceClassicEngine"] = True
+
         _add_testing_set_parameters(suite_set_parameters)
 
         shortcut_opts = {
@@ -368,3 +387,7 @@ def _add_testing_set_parameters(suite_set_parameters):
     """
     suite_set_parameters.setdefault("testingDiagnosticsEnabled", True)
     suite_set_parameters.setdefault("enableTestCommands", True)
+    # The exact file location is on a per-process basis, so it'll have to be determined when the process gets spun up.
+    # Set it to true for now as a placeholder that will error if no further processing is done.
+    # The placeholder is needed so older versions don't have this option won't have this value set.
+    suite_set_parameters.setdefault("backtraceLogFile", True)

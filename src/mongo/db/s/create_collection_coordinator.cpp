@@ -39,7 +39,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/create_gen.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
@@ -58,6 +58,11 @@
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/sharding_feature_flags_gen.h"
+
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+MONGO_FAIL_POINT_DEFINE(failAtCommitCreateCollectionCoordinator);
+
 
 namespace mongo {
 namespace {
@@ -288,6 +293,11 @@ void insertChunks(OperationContext* opCtx,
             entries.push_back(chunk.toConfigBSON());
         }
         insertOp.setDocuments(entries);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
+            wcb.setOrdered(false);
+            return wcb;
+        }());
         return insertOp;
     }());
 
@@ -342,8 +352,8 @@ void broadcastDropCollection(OperationContext* opCtx,
                              const NamespaceString& nss,
                              const std::shared_ptr<executor::TaskExecutor>& executor,
                              const OperationSessionInfo& osi) {
-    const auto primaryShardId = ShardingState::get(opCtx)->shardId();
     const ShardsvrDropCollectionParticipant dropCollectionParticipant(nss);
+    const auto primaryShardId = ShardingState::get(opCtx)->shardId();
 
     auto participants = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
     // Remove primary shard from participants
@@ -351,7 +361,7 @@ void broadcastDropCollection(OperationContext* opCtx,
                        participants.end());
 
     sharding_ddl_util::sendDropCollectionParticipantCommandToShards(
-        opCtx, nss, participants, executor, osi);
+        opCtx, nss, participants, executor, osi, true /* fromMigrate */);
 }
 
 /**
@@ -476,6 +486,8 @@ ExecutorFuture<void> CreateCollectionCoordinator::_runImpl(
                 // Log the start of the event only if we're not recovering.
                 _logStartCreateCollection(opCtx);
 
+                _checkCollectionUUIDMismatch(opCtx);
+
                 // Quick check (without critical section) to see if another create collection
                 // already succeeded.
                 if (auto createCollectionResponseOpt =
@@ -485,7 +497,13 @@ ExecutorFuture<void> CreateCollectionCoordinator::_runImpl(
                             _shardKeyPattern->getKeyPattern().toBSON(),
                             getCollation(opCtx, nss(), _request.getCollation()).second,
                             _request.getUnique().value_or(false))) {
-                    _checkCollectionUUIDMismatch(opCtx);
+
+                    // Ensure that the completion of the request gets recorded at least once on the
+                    // oplog.
+                    _writeOplogMessage(opCtx,
+                                       nss(),
+                                       *createCollectionResponseOpt->getCollectionUUID(),
+                                       _request.toBSON());
 
                     // The critical section can still be held here if the node committed the
                     // sharding of the collection but then it stepped down before it managed to
@@ -495,7 +513,8 @@ ExecutorFuture<void> CreateCollectionCoordinator::_runImpl(
                             opCtx,
                             nss(),
                             _getCriticalSectionReason(),
-                            ShardingCatalogClient::kMajorityWriteConcern);
+                            ShardingCatalogClient::kMajorityWriteConcern,
+                            false /* throwIfReasonDiffers */);
 
                     _result = createCollectionResponseOpt;
                     return;
@@ -531,7 +550,6 @@ ExecutorFuture<void> CreateCollectionCoordinator::_runImpl(
                     }
                 }
 
-                _checkCollectionUUIDMismatch(opCtx);
                 _createPolicy(opCtx);
                 _createCollectionAndIndexes(opCtx);
 
@@ -602,7 +620,8 @@ ExecutorFuture<void> CreateCollectionCoordinator::_runImpl(
                     opCtx,
                     nss(),
                     _getCriticalSectionReason(),
-                    ShardingCatalogClient::kMajorityWriteConcern);
+                    ShardingCatalogClient::kMajorityWriteConcern,
+                    false /* throwIfReasonDiffers */);
             }
             return status;
         });
@@ -792,7 +811,8 @@ void CreateCollectionCoordinator::_createPolicy(OperationContext* opCtx) {
         _request.getInitialSplitPoints(),
         getTagsAndValidate(opCtx, nss(), _shardKeyPattern->toBSON()),
         getNumShards(opCtx),
-        *_collectionEmpty);
+        *_collectionEmpty,
+        !feature_flags::gNoMoreAutoSplitter.isEnabled(serverGlobalParams.featureCompatibility));
 }
 
 void CreateCollectionCoordinator::_createChunks(OperationContext* opCtx) {
@@ -871,6 +891,12 @@ void CreateCollectionCoordinator::_createCollectionOnNonPrimaryShards(
 
 void CreateCollectionCoordinator::_commit(OperationContext* opCtx) {
     LOGV2_DEBUG(5277906, 2, "Create collection _commit", "namespace"_attr = nss());
+
+    if (MONGO_unlikely(failAtCommitCreateCollectionCoordinator.shouldFail())) {
+        LOGV2_DEBUG(6960301, 2, "About to hit failAtCommitCreateCollectionCoordinator fail point");
+        uasserted(ErrorCodes::InterruptedAtShutdown,
+                  "failAtCommitCreateCollectionCoordinator fail point");
+    }
 
     // Upsert Chunks.
     _doc = _updateSession(opCtx, _doc);

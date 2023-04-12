@@ -49,7 +49,7 @@ public:
                        const NamespaceString& nss,
                        const UUID& uuid,
                        BSONObj indexDoc,
-                       bool fromMigrate) override {}
+                       bool fromMigrate) override;
 
     void onStartIndexBuild(OperationContext* opCtx,
                            const NamespaceString& nss,
@@ -206,6 +206,10 @@ public:
         const ApplyOpsOplogSlotAndOperationAssignment* applyOpsOperationAssignment,
         size_t numberOfPrePostImagesToWrite,
         Date_t wallClockTime) override {}
+
+    void onTransactionPrepareNonPrimary(OperationContext* opCtx,
+                                        const std::vector<repl::OplogEntry>& statements,
+                                        const repl::OpTime& prepareOpTime) override {}
 
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) override {}

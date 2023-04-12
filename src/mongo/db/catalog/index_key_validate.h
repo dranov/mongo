@@ -43,6 +43,12 @@ class StatusWith;
 
 namespace index_key_validate {
 
+// TTL indexes with 'expireAfterSeconds' are repaired with this duration, which is chosen to be
+// the largest possible value for the 'safeInt' type that can be returned in the listIndexes
+// response.
+constexpr auto kExpireAfterSecondsForInactiveTTLIndex =
+    Seconds(std::numeric_limits<int32_t>::max());
+
 static std::set<StringData> allowedFieldNames = {
     IndexDescriptor::k2dIndexBitsFieldName,
     IndexDescriptor::k2dIndexMaxFieldName,
@@ -121,9 +127,14 @@ StatusWith<BSONObj> validateIndexSpecCollation(OperationContext* opCtx,
                                                const CollatorInterface* defaultCollator);
 
 /**
- * Validates the the 'expireAfterSeconds' value for a TTL index..
+ * Validates the the 'expireAfterSeconds' value for a TTL index or clustered collection.
  */
-Status validateExpireAfterSeconds(std::int64_t expireAfterSeconds);
+enum class ValidateExpireAfterSecondsMode {
+    kSecondaryTTLIndex,
+    kClusteredTTLIndex,
+};
+Status validateExpireAfterSeconds(std::int64_t expireAfterSeconds,
+                                  ValidateExpireAfterSecondsMode mode);
 
 /**
  * Returns true if 'indexSpec' refers to a TTL index.

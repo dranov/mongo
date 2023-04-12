@@ -33,6 +33,7 @@
 
 #include <vector>
 
+#include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/field_ref_set.h"
 #include "mongo/db/hasher.h"
@@ -89,6 +90,11 @@ std::vector<std::unique_ptr<FieldRef>> parseShardKeyPattern(const BSONObj& keyPa
                     str::stream() << "Field " << patternEl.fieldNameStringData()
                                   << " contains empty parts",
                     !newFieldRef->getPart(i).empty());
+
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "Field " << patternEl.fieldNameStringData()
+                                  << " contains parts that start with '$'",
+                    !newFieldRef->getPart(i).startsWith("$"));
         }
 
         // Numeric and ascending (1.0), or "hashed" with exactly hashed field.
@@ -288,7 +294,7 @@ bool ShardKeyPattern::isShardKey(const BSONObj& shardKey) const {
 }
 
 bool ShardKeyPattern::isExtendedBy(const ShardKeyPattern& newShardKeyPattern) const {
-    return toBSON().isFieldNamePrefixOf(newShardKeyPattern.toBSON());
+    return toBSON().isPrefixOf(newShardKeyPattern.toBSON(), SimpleBSONElementComparator::kInstance);
 }
 
 BSONObj ShardKeyPattern::normalizeShardKey(const BSONObj& shardKey) const {
@@ -544,12 +550,12 @@ BSONObj ShardKeyPattern::extractShardKeyFromQuery(const CanonicalQuery& query) c
     return keyBuilder.obj();
 }
 
-bool ShardKeyPattern::isUniqueIndexCompatible(const BSONObj& uniqueIndexPattern) const {
-    if (!uniqueIndexPattern.isEmpty() && uniqueIndexPattern.firstElementFieldName() == kIdField) {
+bool ShardKeyPattern::isIndexUniquenessCompatible(const BSONObj& indexPattern) const {
+    if (!indexPattern.isEmpty() && indexPattern.firstElementFieldName() == kIdField) {
         return true;
     }
 
-    return _keyPattern.toBSON().isFieldNamePrefixOf(uniqueIndexPattern);
+    return _keyPattern.toBSON().isFieldNamePrefixOf(indexPattern);
 }
 
 BoundList ShardKeyPattern::flattenBounds(const IndexBounds& indexBounds) const {

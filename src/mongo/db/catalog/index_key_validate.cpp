@@ -68,6 +68,10 @@ namespace {
 // specification.
 MONGO_FAIL_POINT_DEFINE(skipIndexCreateFieldNameValidation);
 
+// When the skipTTLIndexNaNExpireAfterSecondsValidation failpoint is enabled, validation for
+// TTL index 'expireAfterSeconds' will be disabled.
+MONGO_FAIL_POINT_DEFINE(skipTTLIndexNaNExpireAfterSecondsValidation);
+
 static const std::set<StringData> allowedIdIndexFieldNames = {
     IndexDescriptor::kCollationFieldName,
     IndexDescriptor::kIndexNameFieldName,
@@ -264,8 +268,8 @@ BSONObj removeUnknownFields(const NamespaceString& ns, const BSONObj& indexSpec)
 BSONObj repairIndexSpec(const NamespaceString& ns,
                         const BSONObj& indexSpec,
                         const std::set<StringData>& allowedFieldNames) {
-    auto fixBoolIndexSpecFn = [&indexSpec, &ns](const BSONElement& indexSpecElem,
-                                                BSONObjBuilder* builder) {
+    auto fixIndexSpecFn = [&indexSpec, &ns](const BSONElement& indexSpecElem,
+                                            BSONObjBuilder* builder) {
         StringData fieldName = indexSpecElem.fieldNameStringData();
         if ((IndexDescriptor::kBackgroundFieldName == fieldName ||
              IndexDescriptor::kUniqueFieldName == fieldName ||
@@ -279,17 +283,28 @@ BSONObj repairIndexSpec(const NamespaceString& ns,
                           "fieldName"_attr = redact(fieldName),
                           "indexSpec"_attr = redact(indexSpec));
             builder->appendBool(fieldName, true);
+        } else if (IndexDescriptor::kExpireAfterSecondsFieldName == fieldName &&
+                   !(indexSpecElem.isNumber() && !indexSpecElem.isNaN())) {
+            LOGV2_WARNING(6835900,
+                          "Fixing expire field from TTL index spec",
+                          "namespace"_attr = redact(ns.toString()),
+                          "fieldName"_attr = redact(fieldName),
+                          "indexSpec"_attr = redact(indexSpec));
+            builder->appendNumber(fieldName,
+                                  durationCount<Seconds>(kExpireAfterSecondsForInactiveTTLIndex));
         } else {
             builder->append(indexSpecElem);
         }
     };
-    return buildRepairedIndexSpec(ns, indexSpec, allowedFieldNames, fixBoolIndexSpecFn);
+
+    return buildRepairedIndexSpec(ns, indexSpec, allowedFieldNames, fixIndexSpecFn);
 }
 
 StatusWith<BSONObj> validateIndexSpec(OperationContext* opCtx, const BSONObj& indexSpec) {
     bool hasKeyPatternField = false;
     bool hasIndexNameField = false;
     bool hasNamespaceField = false;
+    bool isTTLIndexWithNaNExpireAfterSeconds = false;
     bool hasVersionField = false;
     bool hasCollationField = false;
     bool hasWeightsField = false;
@@ -537,6 +552,8 @@ StatusWith<BSONObj> validateIndexSpec(OperationContext* opCtx, const BSONObj& in
                     str::stream() << "The field '" << indexSpecElemFieldName
                                   << "' must be a number, but got "
                                   << typeName(indexSpecElem.type())};
+        } else if (IndexDescriptor::kExpireAfterSecondsFieldName == indexSpecElemFieldName) {
+            isTTLIndexWithNaNExpireAfterSeconds = indexSpecElem.isNaN();
         } else {
             // We can assume field name is valid at this point. Validation of fieldname is handled
             // prior to this in validateIndexSpecFieldNames().
@@ -606,6 +623,19 @@ StatusWith<BSONObj> validateIndexSpec(OperationContext* opCtx, const BSONObj& in
     // require the field to be present.
     if (hasNamespaceField && !storageGlobalParams.repair) {
         modifiedSpec = modifiedSpec.removeField(IndexDescriptor::kNamespaceFieldName);
+    }
+
+    if (isTTLIndexWithNaNExpireAfterSeconds &&
+        !skipTTLIndexNaNExpireAfterSecondsValidation.shouldFail()) {
+        // We create a new index specification with the 'expireAfterSeconds' field set as
+        // kExpireAfterSecondsForInactiveTTLIndex if the current value is NaN. A similar
+        // treatment is done in repairIndexSpec(). This rewrites the 'expireAfterSeconds'
+        // value to be compliant with the 'safeInt' IDL type for the listIndexes response.
+        BSONObjBuilder builder;
+        builder.appendNumber(IndexDescriptor::kExpireAfterSecondsFieldName,
+                             durationCount<Seconds>(kExpireAfterSecondsForInactiveTTLIndex));
+        auto obj = builder.obj();
+        modifiedSpec = modifiedSpec.addField(obj.firstElement());
     }
 
     if (!hasVersionField) {
@@ -768,7 +798,8 @@ StatusWith<BSONObj> validateIndexSpecCollation(OperationContext* opCtx,
     return indexSpec;
 }
 
-Status validateExpireAfterSeconds(std::int64_t expireAfterSeconds) {
+Status validateExpireAfterSeconds(std::int64_t expireAfterSeconds,
+                                  ValidateExpireAfterSecondsMode mode) {
     if (expireAfterSeconds < 0) {
         return {ErrorCodes::InvalidOptions,
                 str::stream() << "TTL index '" << IndexDescriptor::kExpireAfterSecondsFieldName
@@ -779,16 +810,31 @@ Status validateExpireAfterSeconds(std::int64_t expireAfterSeconds) {
         << "TTL index '" << IndexDescriptor::kExpireAfterSecondsFieldName
         << "' option must be within an acceptable range, try a lower number";
 
-    // There are two cases where we can encounter an issue here.
-    // The first case is when we try to cast to millseconds from seconds, which could cause an
-    // overflow. The second case is where 'expireAfterSeconds' is larger than the current epoch
-    // time.
-    if (expireAfterSeconds > std::numeric_limits<std::int64_t>::max() / 1000) {
-        return {ErrorCodes::InvalidOptions, tooLargeErr};
-    }
-    auto expireAfterMillis = duration_cast<Milliseconds>(Seconds(expireAfterSeconds));
-    if (expireAfterMillis > Date_t::now().toDurationSinceEpoch()) {
-        return {ErrorCodes::InvalidOptions, tooLargeErr};
+    if (mode == ValidateExpireAfterSecondsMode::kSecondaryTTLIndex) {
+        // Relax epoch restriction on TTL indexes. This allows us to export and import existing
+        // TTL indexes with large values or NaN for the 'expireAfterSeconds' field.
+        // Additionally, the 'expireAfterSeconds' for TTL indexes is defined as safeInt (int32_t)
+        // in the IDL for listIndexes and collMod. See list_indexes.idl and coll_mod.idl.
+        if (expireAfterSeconds > std::numeric_limits<std::int32_t>::max()) {
+            return {ErrorCodes::InvalidOptions, tooLargeErr};
+        }
+    } else {
+        // Clustered collections with TTL.
+        // Note that 'expireAfterSeconds' is defined as safeInt64 in the IDL for the create and
+        // collMod commands. See create.idl and coll_mod.idl.
+        // There are two cases where we can encounter an issue here.
+        // The first case is when we try to cast to millseconds from seconds, which could cause an
+        // overflow. The second case is where 'expireAfterSeconds' is larger than the current epoch
+        // time. This isn't necessarily problematic for the general case, but for the specific case
+        // of time series collections, we cluster the collection by an OID value, where the
+        // timestamp portion is only a 32-bit unsigned integer offset of seconds since the epoch.
+        if (expireAfterSeconds > std::numeric_limits<std::int64_t>::max() / 1000) {
+            return {ErrorCodes::InvalidOptions, tooLargeErr};
+        }
+        auto expireAfterMillis = duration_cast<Milliseconds>(Seconds(expireAfterSeconds));
+        if (expireAfterMillis > Date_t::now().toDurationSinceEpoch()) {
+            return {ErrorCodes::InvalidOptions, tooLargeErr};
+        }
     }
     return Status::OK();
 }
@@ -812,7 +858,9 @@ Status validateIndexSpecTTL(const BSONObj& indexSpec) {
                               << "'. Index spec: " << indexSpec};
     }
 
-    if (auto status = validateExpireAfterSeconds(expireAfterSecondsElt.safeNumberLong());
+    if (auto status =
+            validateExpireAfterSeconds(expireAfterSecondsElt.safeNumberLong(),
+                                       ValidateExpireAfterSecondsMode::kSecondaryTTLIndex);
         !status.isOK()) {
         return {ErrorCodes::CannotCreateIndex,
                 str::stream() << status.reason() << ". Index spec: " << indexSpec};

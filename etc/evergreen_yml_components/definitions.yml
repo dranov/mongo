@@ -107,6 +107,19 @@ variables:
     vars:
       resmoke_args: --help
 
+- &gen_burn_in_task_template
+  name: gen_burn_in_task_template
+  depends_on:
+  - name: version_gen
+    variant: generate-tasks-for-version
+  - name: version_burn_in_gen
+    variant: generate-tasks-for-version
+  - name: archive_dist_test_debug
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      resmoke_args: --help
+
 - &benchmark_template
   name: benchmark_template
   depends_on:
@@ -118,7 +131,7 @@ variables:
       resmoke_args: --help
       resmoke_jobs_max: 1
   - func: "send benchmark results"
-  - func: "analyze benchmark results"
+#  - func: "analyze benchmark results"
     vars:
       suite: benchmark_suite
 
@@ -299,12 +312,16 @@ variables:
   - enterprise-rhel-80-64-bit-suggested
   - enterprise-rhel-82-arm64
   - enterprise-rhel-83-s390x
+  - enterprise-rhel-90-64-bit
+  - enterprise-rhel-90-arm64
   - enterprise-suse12-64
   - enterprise-suse15-64
   - enterprise-ubuntu1804-64
   - enterprise-ubuntu1804-arm64
   - enterprise-ubuntu2004-arm64
+  - enterprise-ubuntu2204-arm64
   - enterprise-ubuntu2004-64
+  - enterprise-ubuntu2204-64
   - enterprise-windows
   - enterprise-windows-debug-unoptimized
   - enterprise-windows-inmem
@@ -325,8 +342,11 @@ variables:
   - enterprise-rhel-80-64-bit-dynamic-required
   - enterprise-rhel-70-64-bit
   - enterprise-rhel-82-arm64
+  - enterprise-rhel-90-64-bit
+  - enterprise-rhel-90-arm64
   - enterprise-amazon2-arm64
   - enterprise-ubuntu1804-64
+  - enterprise-ubuntu2204-64
   - enterprise-windows
   - enterprise-windows-required
 
@@ -349,10 +369,14 @@ variables:
   - ubi8
   - rhel80
   - rhel-82-arm64
+  - rhel90
+  - rhel90-arm64
   - enterprise-rhel-80-64-bit
   - enterprise-rhel-80-64-bit-suggested  # For testing selinux.
   - enterprise-rhel-82-arm64
   - enterprise-rhel-83-s390x
+  - enterprise-rhel-90-64-bit
+  - enterprise-rhel-90-arm64
   - suse12
   - enterprise-suse12-64
   - suse15
@@ -360,10 +384,13 @@ variables:
   - ubuntu1804
   - ubuntu1804-arm64
   - ubuntu2004-arm64
+  - ubuntu2204-arm64
   - ubuntu2004
+  - ubuntu2204
   - enterprise-ubuntu1804-64
   - enterprise-ubuntu1804-arm64
   - enterprise-ubuntu2004-arm64
+  - enterprise-ubuntu2204-arm64
   - enterprise-ubuntu2004-64
   - enterprise-windows
   - windows
@@ -510,12 +537,23 @@ functions:
       args:
       - "src/evergreen/functions/binaries_extract.sh"
 
-  "check binary version": &check_binary_version
-    command: subprocess.exec
+  "get version expansions": &get_version_expansions
+    command: s3.get
     params:
-      binary: bash
-      args:
-      - "src/evergreen/functions/binary_version_check.sh"
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      remote_file: ${project}/${version_id}/${bv_future_git_tag|version}_expansions.yml
+      bucket: mciuploads
+      local_file: src/version_expansions.yml
+
+  "apply version expansions": &apply_version_expansions
+    command: expansions.update
+    params:
+      file: src/version_expansions.yml
+
+  "get and apply version expansions":
+    - *get_version_expansions
+    - *apply_version_expansions
 
   "fetch benchmarks": &fetch_benchmarks
     command: s3.get
@@ -795,15 +833,10 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/pip-requirements-${task_id}-${execution}.txt
       bucket: mciuploads
       permissions: public-read
-      content_type: atext-plain
+      content_type: text/plain
       display_name: Pip Requirements
 
   "send benchmark results":
-  - command: json.send
-    params:
-      name: perf
-      file: src/perf.json
-
   - command: perf.send
     params:
       aws_key: ${aws_key}
@@ -846,7 +879,6 @@ functions:
   - *adjust_venv
   - *fetch_binaries
   - *extract_binaries
-  - *check_binary_version
   - *get_buildnumber
   - *f_expansions_write
   - *set_up_credentials
@@ -1058,7 +1090,7 @@ functions:
       files:
       - src/generated_resmoke_config/*.json
 
-  "generate burn in tags":
+  "generate version burn in":
   - *f_expansions_write
   - *configure_evergreen_api_credentials
   - command: subprocess.exec
@@ -1066,33 +1098,37 @@ functions:
     params:
       binary: bash
       args:
-      - "./src/evergreen/burn_in_tests_generate.sh"
+      - "./src/evergreen/generate_version_burn_in.sh"
   - command: archive.targz_pack
     params:
-      target: burn_in_tags_gen.tgz
-      source_dir: src/generated_burn_in_tags_config
+      target: generate_tasks_config.tgz
+      source_dir: src/generated_resmoke_config
       include:
       - "*"
   - command: s3.put
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      local_file: burn_in_tags_gen.tgz
-      remote_file: ${project}/${build_variant}/${revision}/burn_in_tags_gen/burn_in_tags_gen-${build_id}.tgz
+      local_file: generate_tasks_config.tgz
+      remote_file: ${project}/${revision}/generate_tasks/generated-burn-in-config-${version_id}.tgz
       bucket: mciuploads
       permissions: public-read
-      content_type: application/gzip
-      display_name: Burn_in_tags Task Config - Execution ${execution}
+      content_type: ${content_type|application/gzip}
+      display_name: Generated Burn In Task Config - Execution ${execution}
+      optional: true
   - command: generate.tasks
     params:
+      optional: true
       files:
-      - src/generated_burn_in_tags_config/burn_in_tags_gen.json
+      - src/generated_resmoke_config/*.json
 
   "generate resmoke tasks":
   - *fetch_artifacts
   - *f_expansions_write
   - *kill_processes
   - *cleanup_environment
+  - *get_version_expansions
+  - *apply_version_expansions
   - *fetch_venv
   - *adjust_venv
   - *f_expansions_write
@@ -1224,6 +1260,8 @@ functions:
       - "src/evergreen/scons_lint.sh"
 
   "scons compile":
+  - *get_version_expansions
+  - *apply_version_expansions
   - *f_expansions_write
   - command: subprocess.exec
     type: test
@@ -1231,6 +1269,38 @@ functions:
       binary: bash
       args:
       - "src/evergreen/scons_compile.sh"
+
+  "ninja compile":
+  - *f_expansions_write
+  - command: subprocess.exec
+    type: test
+    params:
+      binary: bash
+      args:
+      - "./src/evergreen/ninja_compile.sh"
+
+  "generate version expansions": &generate_version_expansions
+    command: subprocess.exec
+    params:
+      binary: bash
+      args:
+      - "src/evergreen/functions/version_expansions_generate.sh"
+
+  "upload version expansions": &upload_version_expansions
+   command: s3.put
+   params:
+     aws_key: ${aws_key}
+     aws_secret: ${aws_secret}
+     local_file: src/version_expansions.yml
+     remote_file: ${project}/${version_id}/${bv_future_git_tag|version}_expansions.yml
+     bucket: mciuploads
+     permissions: public-read
+     content_type: application/x-yaml
+     display_name: version expansions
+
+  "generate and upload version expansions":
+  - *generate_version_expansions
+  - *upload_version_expansions
 
   "generate compile expansions":
   - *f_expansions_write
@@ -1506,6 +1576,8 @@ functions:
       - "./src/evergreen/powercycle_exit.sh"
 
   "run packager.py":
+  - *get_version_expansions
+  - *apply_version_expansions
   - *f_expansions_write
   - command: subprocess.exec
     params:
@@ -1752,6 +1824,24 @@ functions:
   - *archive_jepsen_logs
   - *tar_jepsen_results
   - *archive_jepsen_results
+
+  "save blackduck artifacts":
+  - command: archive.targz_pack
+    params:
+      target: blackduck.tgz
+      source_dir: /home/ec2-user/blackduck/runs/
+      include:
+      - "**"
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: blackduck.tgz
+      remote_file: ${project}/${build_variant}/${version_id}/blackduck-${task_id}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/gzip}
+      display_name: BlackDuck logs
 
   ### Process & archive mongo coredumps ###
   "gather mongo coredumps": &gather_mongo_coredumps
@@ -2076,7 +2166,7 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/local-resmoke-invocation-${task_id}-${execution}.txt
       bucket: mciuploads
       permissions: public-read
-      content_type: atext-plain
+      content_type: text/plain
       display_name: Resmoke.py Invocation for Local Usage
 
 
@@ -2099,6 +2189,7 @@ post:
 - func: "save local client logs"
 - func: "save code coverage data"
 - func: "save jepsen artifacts"
+- func: "save blackduck artifacts"
 - func: "save mongo coredumps"
 - func: "save failed unittests"
 - func: "save hang analyzer debugger files"
@@ -2125,7 +2216,9 @@ tasks:
 ## compile - build all scons targets except unittests ##
 - name: compile_dist_test
   tags: []
-  depends_on: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
@@ -2150,13 +2243,20 @@ tasks:
   depends_on:
   - name: compile_dist_test
   commands:
-  - *f_expansions_write
   - func: "scons compile"
     vars:
       targets: >-
         archive-dist-test
       task_compile_flags: >-
         PREFIX=dist-test
+  - command: subprocess.exec
+    params:
+      binary: bash
+      add_expansions_to_env: true
+      args:
+      - "src/evergreen/run_python_script.sh"
+      - "evergreen/macos_notary.py"
+      - "mongodb-binaries.${ext|tgz}"
 
   - command: s3.put
     params:
@@ -2206,7 +2306,6 @@ tasks:
       - "./etc/repo_config.yaml"
       - "./etc/scons/**"
       - "buildscripts/**"
-      - "compile_expansions.yml"
       - "all_feature_flags.txt"  # Must correspond to the definition in buildscripts/idl/lib.py.
       - "jstests/**"
       - "patch_files.txt"
@@ -2271,47 +2370,120 @@ tasks:
 
 - name: compile_ninja
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
       generating_for_ninja: true
       separate_debug: off
-      task_install_action:
-        default
       task_compile_flags: >-
         --ninja
-      targets:
-        generate-ninja
   - *f_expansions_write
-  - command: subprocess.exec
-    params:
-      binary: bash
-      args:
-      - "./src/evergreen/ninja_compile.sh"
+  - func: "ninja compile"
+    vars:
+      ninja_file: "build.ninja"
+
+- name: compile_ninja_default_profile
+  tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+  - func: "scons compile"
+    vars:
+      generating_for_ninja: true
+      separate_debug: off
+      task_compile_flags: >-
+        --build-profile=default
+        --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+        --ninja
+  - *f_expansions_write
+  - func: "ninja compile"
+    vars:
+      ninja_file: "build.ninja"
+
+- name: compile_ninja_opt_profile
+  tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+  - func: "scons compile"
+    vars:
+      generating_for_ninja: true
+      separate_debug: off
+      task_compile_flags: >-
+        --build-profile=opt
+        CCACHE=
+        ICECC=
+  - *f_expansions_write
+  - func: "ninja compile"
+    vars:
+      ninja_file: "opt.ninja"
+
+- name: compile_ninja_fast_profile
+  tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+  - func: "scons compile"
+    vars:
+      generating_for_ninja: true
+      separate_debug: off
+      task_compile_flags: >-
+        --build-profile=fast
+        CCACHE=
+        ICECC=
+  - *f_expansions_write
+  - func: "ninja compile"
+    vars:
+      ninja_file: "fast.ninja"
+
+- name: compile_ninja_san_profile
+  tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+  - func: "scons compile"
+    vars:
+      generating_for_ninja: true
+      separate_debug: off
+      task_compile_flags: >-
+        --build-profile=san
+        CCACHE=
+        ICECC=
+  - *f_expansions_write
+  - func: "ninja compile"
+    vars:
+      ninja_file: "san.ninja"
 
 - name: compile_ninja_next
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
       generating_for_ninja: true
       separate_debug: off
-      task_install_action:
-        default
       task_compile_flags: >-
         --build-tools=next
         --ninja
-      targets:
-        generate-ninja
   - *f_expansions_write
-  - command: subprocess.exec
-    params:
-      binary: bash
-      args:
-      - "./src/evergreen/ninja_compile.sh"
+  - func: "ninja compile"
+    vars:
+      ninja_file: "build.ninja"
 
 - name: compile_build_tools_next
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
@@ -2322,6 +2494,9 @@ tasks:
 
 - name: libdeps_graph_linting
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - *f_expansions_write
   - command: subprocess.exec
@@ -2381,10 +2556,14 @@ tasks:
 - name: clang_tidy
   tags: []
   exec_timeout_secs: 3600 # 1 hour timeout for the task overall
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
-  - *f_expansions_write
   - func: "scons compile"
     vars:
+      task_compile_flags: >-
+        --build-profile=compiledb
       targets: generated-sources compiledb
       compiling_for_test: true
   - command: subprocess.exec
@@ -2429,7 +2608,7 @@ tasks:
 ## run_unittests with UndoDB live-record ##
 #- name: run_unittests_with_recording
 #  depends_on:
-#    - name: compile_unittests_for_recorded_unittest
+#  - name: compile_unittests_for_recorded_unittest
 #  commands:
 #    - *f_expansions_write
 #    - func: "run diskstats"
@@ -2458,6 +2637,9 @@ tasks:
 ##compile_and_archive_libfuzzertests - build libfuzzertests ##
 - name: compile_and_archive_libfuzzertests
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
@@ -2488,6 +2670,9 @@ tasks:
 
 - name: server_discovery_and_monitoring_json_test
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
@@ -2500,6 +2685,9 @@ tasks:
 
 - name: server_selection_json_test
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
@@ -2547,6 +2735,9 @@ tasks:
 
 - name: compile_visibility_test
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
@@ -2574,7 +2765,12 @@ tasks:
 
 - name: embedded_sdk_build_cdriver
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
+  - *get_version_expansions
+  - *apply_version_expansions
   - func: f_expansions_write
   - command: subprocess.exec
     params:
@@ -2609,6 +2805,8 @@ tasks:
   depends_on:
   - name: embedded_sdk_install_dev
   commands:
+  - *get_version_expansions
+  - *apply_version_expansions
   - *f_expansions_write
   - command: subprocess.exec
     params:
@@ -2652,6 +2850,8 @@ tasks:
   depends_on:
   - name: embedded_sdk_install_tests
   commands:
+  - *get_version_expansions
+  - *apply_version_expansions
   - *f_expansions_write
   - command: subprocess.exec
     type: test
@@ -2678,6 +2878,8 @@ tasks:
   depends_on:
   - name: embedded_sdk_install_tests
   commands:
+  - *get_version_expansions
+  - *apply_version_expansions
   - *f_expansions_write
   - command: subprocess.exec
     type: test
@@ -2696,6 +2898,8 @@ tasks:
   depends_on:
   - name: embedded_sdk_run_tests
   commands:
+  - *get_version_expansions
+  - *apply_version_expansions
   # A second put, this time to -latest, to give devs a reasonable
   # way to get the most recent build.
   - command: s3.put
@@ -2715,6 +2919,8 @@ tasks:
   depends_on:
   - name: embedded_sdk_run_tests
   commands:
+  - *get_version_expansions
+  - *apply_version_expansions
   # A second put, this time to -latest, to give devs a reasonable
   # way to get the most recent build.
   - command: s3.put
@@ -2731,6 +2937,9 @@ tasks:
 
 - name: stitch_support_create_lib
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - *f_expansions_write
   - func: "scons compile"
@@ -2781,6 +2990,7 @@ tasks:
   depends_on:
   - name: stitch_support_install_tests
   commands:
+  - func: "get and apply version expansions"
   - *f_expansions_write
   - command: subprocess.exec
     type: test
@@ -2791,6 +3001,9 @@ tasks:
 
 - name: crypt_create_lib
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - *f_expansions_write
   - func: "scons compile"
@@ -2799,7 +3012,7 @@ tasks:
       task_compile_flags: >-
         --allocator=system
         --enable-free-mon=off
-        --enterprise-features=fle
+        --enterprise-features=fle,search
         --js-engine=none
         --link-model=dynamic-sdk
         --enable-http-client=off
@@ -2824,6 +3037,9 @@ tasks:
 
 - name: crypt_create_debug_lib
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - *f_expansions_write
   - func: "scons compile"
@@ -2834,7 +3050,7 @@ tasks:
         --opt=off
         --allocator=system
         --enable-free-mon=off
-        --enterprise-features=fle
+        --enterprise-features=fle,search
         --js-engine=none
         --link-model=dynamic-sdk
         DESTDIR='$BUILD_ROOT/crypt-lib-$MONGO_VERSION'
@@ -2869,15 +3085,14 @@ tasks:
     vars:
       targets: archive-mongo-crypt-shlib-test
       compiling_for_test: true
-      task_install_action:
-        default
       task_compile_flags: >-
         --allocator=system
         --enable-free-mon=off
-        --enterprise-features=fle
+        --enterprise-features=fle,search
         --js-engine=none
         --link-model=static
         DESTDIR='$BUILD_ROOT/crypt-lib-$MONGO_VERSION'
+        RPATH='$$RPATH_ESCAPED_DOLLAR_ORIGIN/../lib'
   - command: s3.put
     params:
       aws_key: ${aws_key}
@@ -2894,6 +3109,7 @@ tasks:
   depends_on:
   - name: crypt_install_tests
   commands:
+  - func: "get and apply version expansions"
   - *f_expansions_write
   - command: subprocess.exec
     type: test
@@ -2904,7 +3120,9 @@ tasks:
 
 - name: compile_benchmarks
   tags: []
-  depends_on: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - command: manifest.load
   - func: "git get project and add git tag"
@@ -3094,46 +3312,11 @@ tasks:
       args:
       - "src/evergreen/check_idl_compat.sh"
 
-- name: burn_in_tests_gen
+- <<: *gen_burn_in_task_template
+  name: burn_in_tests_gen
   tags: []
   commands:
-  - command: manifest.load
-  - func: "git get project and add git tag"
-  - *f_expansions_write
-  - *kill_processes
-  - *cleanup_environment
-  - func: "set up venv"
-  - func: "upload pip requirements"
-  - func: "configure evergreen api credentials"
-  - command: subprocess.exec
-    type: test
-    params:
-      binary: bash
-      args:
-      - "src/evergreen/burn_in_tests.sh"
-      env:
-        BURN_IN_TESTS: ${burn_in_tests}
-  - command: archive.targz_pack
-    params:
-      target: src/burn_in_tests_gen.tgz
-      source_dir: src
-      include:
-      - burn_in_tests_gen.json
-
-  - command: s3.put
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: src/burn_in_tests_gen.tgz
-      remote_file: ${project}/${build_variant}/${revision}/burn_in_tests_gen/burn_in_tests_gen-${build_id}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: application/gzip
-      display_name: Burn_in_tests Task Config - Execution ${execution}
-  - command: generate.tasks
-    params:
-      files:
-      - src/burn_in_tests_gen.json
+  - func: "generate resmoke tasks"
 
 - <<: *benchmark_template
   name: benchmarks_orphaned
@@ -3146,7 +3329,7 @@ tasks:
       exec_timeout_secs: 14400  # 4 hour timeout.
       resmoke_jobs_max: 1
   - func: "send benchmark results"
-  - func: "analyze benchmark results"
+#  - func: "analyze benchmark results"
     vars:
       suite: benchmarks
 
@@ -3160,7 +3343,7 @@ tasks:
       suite: benchmarks_sharding
       resmoke_jobs_max: 1
   - func: "send benchmark results"
-  - func: "analyze benchmark results"
+#  - func: "analyze benchmark results"
 
 # Disabled under SERVER-64949.
 # - <<: *benchmark_template
@@ -3274,6 +3457,7 @@ tasks:
       npm_command: initsync-fuzzer
       suite: initial_sync_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      run_no_feature_flag_tests: "true"
 
 ## initial sync generational fuzzer ##
 - <<: *jstestfuzz_template
@@ -3302,6 +3486,7 @@ tasks:
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-fuzzer
+      run_no_feature_flag_tests: "true"
 
 ## Standalone generational fuzzer for multiversion aggregation expressions ##
 - <<: *jstestfuzz_template
@@ -3316,6 +3501,7 @@ tasks:
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-expr-fuzzer
+      run_no_feature_flag_tests: "true"
 
 ## Standalone generational fuzzer for checking optimized and unoptimized expression equivalence
 - <<: *jstestfuzz_template
@@ -3435,6 +3621,7 @@ tasks:
       npm_command: update-fuzzer
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      run_no_feature_flag_tests: "true"
 
 ## jstestfuzz standalone update time-series generational fuzzer ##
 - <<: *jstestfuzz_template
@@ -3464,6 +3651,7 @@ tasks:
       npm_command: update-fuzzer
       suite: generational_fuzzer_replication
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      run_no_feature_flag_tests: "true"
 
 ## rollback multiversion fuzzer ##
 - <<: *jstestfuzz_template
@@ -3480,6 +3668,7 @@ tasks:
       # Rollback suites create indexes with majority of nodes not available for replication. So, disabling
       # index build commit quorum.
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}, enableIndexBuildCommitQuorum: false}'"
+      run_no_feature_flag_tests: "true"
 
 ## rollback generational fuzzer ##
 - <<: *jstestfuzz_template
@@ -3792,6 +3981,7 @@ tasks:
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       suite: jstestfuzz_replication
       npm_command: jstestfuzz
+      run_no_feature_flag_tests: "true"
 
 ## jstestfuzz initial sync replica set ##
 - <<: *jstestfuzz_template
@@ -3858,6 +4048,7 @@ tasks:
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       suite: jstestfuzz_sharded
       npm_command: jstestfuzz
+      run_no_feature_flag_tests: "true"
 
 ## jstestfuzz sharded cluster causal consistency ##
 - <<: *jstestfuzz_template
@@ -3984,6 +4175,8 @@ tasks:
   tags: ["multiversion", "multiversion_sanity_check"]
   commands:
   - func: "generate resmoke tasks"
+    vars:
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: replica_sets_jscore_multiversion_gen
@@ -3992,6 +4185,7 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: replica_sets_jscore_passthrough
+      run_no_feature_flag_tests: "true"
 
 
 # Check that the mutational fuzzer can parse JS files modified in a patch build.
@@ -4145,25 +4339,11 @@ tasks:
   commands:
   - func: "generate resmoke tasks"
 
-- name: burn_in_tags_gen
+- <<: *gen_burn_in_task_template
+  name: burn_in_tags_gen
   tags: []
-  depends_on:
-  - name: archive_dist_test
   commands:
-  - command: manifest.load
-  - func: "git get project and add git tag"
-  - *f_expansions_write
-  - *kill_processes
-  - *cleanup_environment
-  - func: "set up venv"
-  - func: "upload pip requirements"
-  - func: "configure evergreen api credentials"
-  - func: "generate burn in tags"
-    vars:
-      max_revisions: 25
-      repeat_tests_secs: 600
-      repeat_tests_min: 2
-      repeat_tests_max: 1000
+  - func: "generate resmoke tasks"
 
 - name: version_gen
   commands:
@@ -4176,6 +4356,30 @@ tasks:
   - func: "set up venv"
   - func: "upload pip requirements"
   - func: "generate version"
+
+- name: version_burn_in_gen
+  commands:
+  - command: manifest.load
+  - *git_get_project
+  - *f_expansions_write
+  - *add_git_tag
+  - *kill_processes
+  - *cleanup_environment
+  - func: "set up venv"
+  - func: "upload pip requirements"
+  - func: "generate version burn in"
+
+- name: version_expansions_gen
+  commands:
+  - command: manifest.load
+  - *git_get_project
+  - *f_expansions_write
+  - *add_git_tag
+  - *kill_processes
+  - *cleanup_environment
+  - func: "set up venv"
+  - func: "upload pip requirements"
+  - func: "generate and upload version expansions"
 
 - name: selected_tests_gen
   tags: []
@@ -4216,12 +4420,15 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: change_streams
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: change_streams_downgrade_gen
   tags: ["multiversion_passthrough", "multiversion"]
   commands:
   - func: "generate resmoke tasks"
+    vars:
+      run_no_feature_flag_tests: "true"
 
 - <<: *task_template
   name: change_streams_update_v1_oplog
@@ -4282,6 +4489,7 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: change_streams_sharded_collections_passthrough
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: multiversion_future_git_tag_gen
@@ -4592,7 +4800,9 @@ tasks:
   - func: "run tests"
     vars:
       suite: core
-      resmoke_args: --fuzzMongodConfigs
+      resmoke_args: >-
+        --fuzzMongodConfigs
+        --excludeWithAnyTags=does_not_support_config_fuzzer
 
 - <<: *task_template
   name: config_fuzzer_concurrency
@@ -4602,7 +4812,9 @@ tasks:
   - func: "run tests"
     vars:
       suite: concurrency
-      resmoke_args: --fuzzMongodConfigs
+      resmoke_args: >-
+        --fuzzMongodConfigs
+        --excludeWithAnyTags=does_not_support_config_fuzzer
 
 - <<: *task_template
   name: config_fuzzer_simulate_crash_concurrency_replication
@@ -4612,7 +4824,9 @@ tasks:
   - func: "run tests"
     vars:
       suite: simulate_crash_concurrency_replication
-      resmoke_args: --fuzzMongodConfigs
+      resmoke_args: >-
+        --fuzzMongodConfigs
+        --excludeWithAnyTags=does_not_support_config_fuzzer
 
 - <<: *task_template
   name: config_fuzzer_concurrency_replication
@@ -4622,7 +4836,9 @@ tasks:
   - func: "run tests"
     vars:
       suite: concurrency_replication
-      resmoke_args: --fuzzMongodConfigs
+      resmoke_args: >-
+        --fuzzMongodConfigs
+        --excludeWithAnyTags=does_not_support_config_fuzzer
 
 - <<: *task_template
   name: config_fuzzer_replica_sets_jscore_passthrough
@@ -4632,7 +4848,9 @@ tasks:
   - func: "run tests"
     vars:
       suite: replica_sets_jscore_passthrough
-      resmoke_args: --fuzzMongodConfigs
+      resmoke_args: >-
+        --fuzzMongodConfigs
+        --excludeWithAnyTags=does_not_support_config_fuzzer
 
 - <<: *task_template
   name: jsCore_ese
@@ -4973,12 +5191,11 @@ tasks:
     vars:
       resmoke_jobs_max: 1
 
-- <<: *task_template
-  name: sharded_collections_jscore_passthrough
+- <<: *gen_task_template
+  name: sharded_collections_jscore_passthrough_gen
   tags: ["sharding", "jscore"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
 
 - <<: *gen_task_template
   name: sharded_collections_jscore_multiversion_gen
@@ -4987,6 +5204,7 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: sharded_collections_jscore_passthrough
+      run_no_feature_flag_tests: "true"
 
 - <<: *task_template
   name: sharding_jscore_passthrough
@@ -5002,6 +5220,7 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: sharding_jscore_passthrough
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: sharding_api_version_jscore_passthrough_gen
@@ -5227,6 +5446,7 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: concurrency_replication
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: concurrency_replication_causal_consistency_gen
@@ -5305,6 +5525,7 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: concurrency_sharded_replication
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: concurrency_sharded_replication_with_balancer_gen
@@ -5512,12 +5733,13 @@ tasks:
     vars:
       use_large_distro: "true"
 
-- <<: *task_template
-  name: write_concern_majority_passthrough
+- <<: *gen_task_template
+  name: write_concern_majority_passthrough_gen
   tags: ["read_write_concern", "large", "write"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
 
 - <<: *task_template
   name: cwrwc_passthrough
@@ -5605,6 +5827,7 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: replica_sets
+      run_no_feature_flag_tests: "true"
 
 - <<: *task_template
   name: sasl
@@ -5636,6 +5859,7 @@ tasks:
     vars:
       use_large_distro: "true"
       suite: sharding
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: sharding_max_mirroring_gen
@@ -5702,6 +5926,8 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       use_large_distro: "true"
+      multiversion_exclude_tags_version: last_lts
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: sharding_update_v1_oplog_gen
@@ -5825,22 +6051,21 @@ tasks:
 # Use explicit task definitions for retryable_writes_downgrade suites to avoid running
 # with all Repl multiversion combinations.
 - <<: *gen_task_template
-  name: retryable_writes_downgrade_last_continuous_gen
-  tags: ["multiversion_passthrough", "multiversion", "no_version_combination"]
-  commands:
-  - func: "generate resmoke tasks"
-
-- <<: *gen_task_template
   name: retryable_writes_downgrade_last_lts_gen
   tags: ["multiversion_passthrough", "multiversion", "no_version_combination"]
   commands:
   - func: "generate resmoke tasks"
+    vars:
+      multiversion_exclude_tags_version: last_lts
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: sharded_retryable_writes_downgrade_gen
   tags: ["multiversion_passthrough", "multiversion"]
   commands:
   - func: "generate resmoke tasks"
+    vars:
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: logical_session_cache_replication_default_refresh_jscore_passthrough_gen
@@ -6214,7 +6439,41 @@ tasks:
   - func: "run selinux tests"
     vars:
       distro: rhel80-selinux
+- name: selinux_rhel9_org
+  tags: []
+  depends_on:
+  - name: archive_dist_test
+  - name: package
+  commands:
+  - command: manifest.load
+  - func: "git get project and add git tag"
+  - *f_expansions_write
+  - func: "set up venv"
+  - func: "fetch packages"
+  - func: "fetch binaries"
+  - func: "extract binaries"
+  - func: "run selinux tests"
+    vars:
+      distro: rhel90-selinux
+      test_list: jstests/selinux/*.js
+- name: selinux_rhel9_enterprise
+  tags: []
+  depends_on:
+  - name: archive_dist_test
+  - name: package
+  commands:
+  - command: manifest.load
+  - func: "git get project and add git tag"
+  - *f_expansions_write
+  - func: "set up venv"
+  - func: "fetch packages"
+  - func: "fetch binaries"
+  - func: "extract binaries"
+  - func: "run selinux tests"
+    vars:
+      distro: rhel90-selinux
       test_list: jstests/selinux/*.js src/mongo/db/modules/enterprise/jstests/selinux/*.js
+
 
 - name: selinux_rhel7_org
   tags: []
@@ -6323,26 +6582,6 @@ tasks:
   - func: "do setup"
   - func: "run tests"
 
-- name: test_packages
-  tags: []
-  depends_on:
-  - name: package
-  commands:
-  - command: manifest.load
-  - func: "git get project and add git tag"
-  - *f_expansions_write
-  - *kill_processes
-  - *cleanup_environment
-  - *set_up_venv
-  - func: "fetch packages"
-  - func: "set up remote credentials"
-    vars:
-      private_key_file: ~/.ssh/kitchen.pem
-      private_key_remote: ${kitchen_private_key}
-      aws_key_remote: ${kitchen_aws_key}
-      aws_secret_remote: ${kitchen_aws_secret}
-  - func: "run kitchen"
-
 - name: package
   tags: []
   depends_on:
@@ -6360,6 +6599,14 @@ tasks:
         ${additional_package_targets|}
       task_compile_flags: >-
         --legacy-tarball
+  - command: subprocess.exec
+    params:
+      binary: bash
+      add_expansions_to_env: true
+      args:
+      - "src/evergreen/run_python_script.sh"
+      - "evergreen/macos_notary.py"
+      - "mongodb-dist.${ext|tgz}"
   - func: "f_expansions_write"
   - command: subprocess.exec
     params:
@@ -6487,6 +6734,7 @@ tasks:
 
 
 - name: publish_packages
+  run_on: rhel80-small
   tags: ["publish"]
   # This should prevent this task from running in patch builds, where we
   # don't want to publish packages.
@@ -6501,6 +6749,7 @@ tasks:
   commands:
   - command: manifest.load
   - func: "git get project and add git tag"
+  - func: "get and apply version expansions"
   - func: "f_expansions_write"
   - func: "kill processes"
   - func: "cleanup environment"
@@ -6521,6 +6770,7 @@ tasks:
       - "./src/evergreen/packages_publish.sh"
 
 - name: push
+  run_on: rhel80-small
   tags: ["publish"]
   patchable: false
   depends_on:
@@ -6532,6 +6782,7 @@ tasks:
   commands:
   - command: manifest.load
   - func: "git get project and add git tag"
+  - func: "get and apply version expansions"
   - func: "f_expansions_write"
   - func: "kill processes"
   - func: "cleanup environment"
@@ -6573,13 +6824,28 @@ tasks:
       aws_key_remote: ${repo_aws_key}
       aws_secret_remote: ${repo_aws_secret}
   - func: "f_expansions_write"
-  - func: "set up notary client credentials"
+
+  # login to container registry
+  - command: shell.exec
+    params:
+      shell: bash
+      script: |
+        set -oe
+        podman login --username ${release_tools_container_registry_username} --password ${release_tools_container_registry_password} ${release_tools_container_registry}
+
+  # signing windows artifacts
   - command: subprocess.exec
-    type: test
     params:
       binary: bash
       args:
-      - "./src/evergreen/notary_client_run.sh"
+      - "./src/evergreen/garasign_jsign_sign.sh"
+
+  # signing linux artifacts
+  - command: subprocess.exec
+    params:
+      binary: bash
+      args:
+      - "./src/evergreen/garasign_gpg_sign.sh"
 
   # Put the binaries tarball/zipfile
   - command: s3.put
@@ -6692,7 +6958,7 @@ tasks:
       aws_secret: ${aws_secret}
       permissions: public-read
       build_variants: ["enterprise-windows", "windows"]
-      local_file: src/mongodb-${push_name}-${push_arch}-${suffix}-signed.msi
+      local_file: src/mongodb-${push_name}-${push_arch}-${suffix}.msi
       bucket: build-push-testing
       content_type: application/x-msi
       remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}-signed.msi
@@ -6751,7 +7017,7 @@ tasks:
       aws_secret: ${aws_secret}
       permissions: public-read
       build_variants: ["enterprise-windows", "windows"]
-      local_file: src/mongodb-${push_name}-${push_arch}-${suffix}-signed.msi.sha1
+      local_file: src/mongodb-${push_name}-${push_arch}-${suffix}.msi.sha1
       bucket: build-push-testing
       content_type: text/plain
       remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}-signed.msi.sha1
@@ -6809,7 +7075,7 @@ tasks:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       build_variants: ["enterprise-windows", "windows"]
-      local_file: src/mongodb-${push_name}-${push_arch}-${suffix}-signed.msi.sha256
+      local_file: src/mongodb-${push_name}-${push_arch}-${suffix}.msi.sha256
       bucket: build-push-testing
       permissions: public-read
       remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}-signed.msi.sha256
@@ -6868,7 +7134,7 @@ tasks:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       build_variants: ["enterprise-windows", "windows"]
-      local_file: src/mongodb-${push_name}-${push_arch}-${suffix}-signed.msi.md5
+      local_file: src/mongodb-${push_name}-${push_arch}-${suffix}.msi.md5
       bucket: build-push-testing
       permissions: public-read
       content_type: text/plain
@@ -6999,6 +7265,7 @@ tasks:
          'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
 
 - name: crypt_push
+  run_on: rhel80-small
   tags: ["publish_crypt"]
   patchable: false
   stepback: false
@@ -7015,6 +7282,8 @@ tasks:
   - func: "set up venv"
   - func: "upload pip requirements"
   - func: "get buildnumber"
+  - func: "f_expansions_write"
+  - func: "get and apply version expansions"
   - func: "f_expansions_write"
   - func: "generate compile expansions"
   - func: "apply compile expansions"
@@ -7364,6 +7633,26 @@ task_groups:
       display_name: build.ninja
 
 - <<: *compile_task_group_template
+  name: compile_ninja_default_profile_TG
+  tasks:
+  - compile_ninja_default_profile
+
+- <<: *compile_task_group_template
+  name: compile_ninja_opt_profile_TG
+  tasks:
+  - compile_ninja_opt_profile
+
+- <<: *compile_task_group_template
+  name: compile_ninja_san_profile_TG
+  tasks:
+  - compile_ninja_san_profile
+
+- <<: *compile_task_group_template
+  name: compile_ninja_fast_profile_TG
+  tasks:
+  - compile_ninja_fast_profile
+
+- <<: *compile_task_group_template
   name: server_discovery_and_monitoring_json_test_TG
   tasks:
   - server_discovery_and_monitoring_json_test
@@ -7544,6 +7833,7 @@ task_groups:
   tags: ["stitch"]
   tasks:
   - "stitch_support_create_lib"
+
 - <<: *stitch_support_task_group_template
   name: stitch_support_lib_build_and_test
   tags: ["stitch"]

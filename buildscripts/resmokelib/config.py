@@ -55,7 +55,7 @@ DEFAULTS = {
     "archive_limit_tests": 10,
     "base_port": 20000,
     "backup_on_restart_dir": None,
-    "buildlogger_url": "https://logkeeper.mongodb.org",
+    "buildlogger_url": "https://logkeeper2.build.10gen.cc",
     "continue_on_failure": False,
     "dbpath_prefix": None,
     "dbtest_executable": None,
@@ -91,8 +91,9 @@ DEFAULTS = {
     "report_failure_status": "fail",
     "report_file": None,
     "run_all_feature_flag_tests": False,
-    "run_all_feature_flags_no_tests": False,
+    "run_no_feature_flag_tests": False,
     "additional_feature_flags": None,
+    "additional_feature_flags_file": None,
     "seed": int(time.time() * 256),  # Taken from random.py code in Python 2.7.
     "service_executor": None,
     "shell_conn_string": None,
@@ -375,8 +376,11 @@ INSTALL_DIR = None
 # Whether to run tests for feature flags.
 RUN_ALL_FEATURE_FLAG_TESTS = None
 
-# Whether to run the server with feature flags. Defaults to true if `RUN_ALL_FEATURE_FLAG_TESTS` is true.
-RUN_ALL_FEATURE_FLAGS = None
+# Whether to run the tests with enabled feature flags
+RUN_NO_FEATURE_FLAG_TESTS = None
+
+# the path to a file containing feature flags
+ADDITIONAL_FEATURE_FLAGS_FILE = None
 
 # List of enabled feature flags.
 ENABLED_FEATURE_FLAGS = []
@@ -576,3 +580,12 @@ SHORTEN_LOGGER_NAME_CONFIG: dict = {}
 # that get loaded for multiversion tests can behave correctly on master and on v5.0; the latter
 # case runs 5.0 and 4.4 binaries and has this value set to True. Can be removed after 6.0.
 USE_LEGACY_MULTIVERSION = True
+
+# Expansions file location
+# in CI, the expansions file is located in the ${workdir}, one dir up
+# from src, the checkout directory
+EXPANSIONS_FILE = "../expansions.yml" if 'CI' in os.environ else None
+
+# Symbolizer secrets
+SYMBOLIZER_CLIENT_SECRET = None
+SYMBOLIZER_CLIENT_ID = None

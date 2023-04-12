@@ -58,6 +58,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/s/is_mongos.h"
@@ -604,7 +605,6 @@ protected:
      * following:
      *
      * {1, 2, 3, 4, 5}
-     * {12, 3, 4, 5}
      * {12, 34, 5}
      * {1234, 5}
      */
@@ -654,7 +654,7 @@ protected:
                 auto iteratorPtr = std::shared_ptr<Iterator>(writer.done());
                 mergeIterator->closeSource();
                 mergedIterators.push_back(std::move(iteratorPtr));
-                this->_numSpills++;
+                this->_stats.incrementSpilledRanges();
             }
 
             LOGV2_DEBUG(6033101,
@@ -715,7 +715,7 @@ public:
                                this->_opts.dbName,
                                range.getChecksum());
                        });
-        this->_numSpills = this->_iters.size();
+        this->_stats.setSpilledRanges(this->_iters.size());
     }
 
     void add(const Key& key, const Value& val) {
@@ -723,12 +723,24 @@ public:
 
         _data.emplace_back(key.getOwned(), val.getOwned());
 
-        auto memUsage = key.memUsageForSorter() + val.memUsageForSorter();
-        _memUsed += memUsage;
-        this->_totalDataSizeSorted += memUsage;
+        auto& memPool = this->_memPool;
+        if (memPool) {
+            auto memUsedInsideSorter = (sizeof(Key) + sizeof(Value)) * (_data.size() + 1);
+            _memUsed = memPool->memUsage() + memUsedInsideSorter;
+            this->_totalDataSizeSorted = _memUsed;
+        } else {
+            auto memUsage = key.memUsageForSorter() + val.memUsageForSorter();
+            _memUsed += memUsage;
+            this->_totalDataSizeSorted += memUsage;
+        }
 
-        if (_memUsed > this->_opts.maxMemoryUsageBytes)
+        if (_memUsed > this->_opts.maxMemoryUsageBytes) {
             spill();
+            if (memPool) {
+                // We expect that all buffers are unused at this point.
+                memPool->freeUnused();
+            }
+        }
     }
 
     void emplace(Key&& key, Value&& val) override {
@@ -807,7 +819,7 @@ private:
 
         _memUsed = 0;
 
-        this->_numSpills++;
+        this->_stats.incrementSpilledRanges();
     }
 
     bool _done = false;
@@ -824,7 +836,7 @@ public:
     typedef SortIteratorInterface<Key, Value> Iterator;
 
     LimitOneSorter(const SortOptions& opts, const Comparator& comp)
-        : _comp(comp), _haveData(false) {
+        : Sorter<Key, Value>(opts), _comp(comp), _haveData(false) {
         verify(opts.limit == 1);
     }
 
@@ -1094,7 +1106,7 @@ private:
 
         _memUsed = 0;
 
-        this->_numSpills++;
+        this->_stats.incrementSpilledRanges();
     }
 
     bool _done = false;
@@ -1114,21 +1126,39 @@ private:
 
 }  // namespace sorter
 
+namespace {
+SharedBufferFragmentBuilder makeMemPool() {
+    return SharedBufferFragmentBuilder(
+        gOperationMemoryPoolBlockInitialSizeKB.loadRelaxed() * static_cast<size_t>(1024),
+        SharedBufferFragmentBuilder::DoubleGrowStrategy(
+            gOperationMemoryPoolBlockMaxSizeKB.loadRelaxed() * static_cast<size_t>(1024)));
+}
+}  // namespace
+
 template <typename Key, typename Value>
 Sorter<Key, Value>::Sorter(const SortOptions& opts)
-    : _opts(opts),
+    : SorterBase(opts.sorterTracker),
+      _opts(opts),
       _file(opts.extSortAllowed ? std::make_shared<Sorter<Key, Value>::File>(
                                       opts.tempDir + "/" + nextFileName(), opts.sorterFileStats)
-                                : nullptr) {}
+                                : nullptr) {
+    if (opts.useMemPool) {
+        _memPool.emplace(makeMemPool());
+    }
+}
 
 template <typename Key, typename Value>
 Sorter<Key, Value>::Sorter(const SortOptions& opts, const std::string& fileName)
-    : _opts(opts),
+    : SorterBase(opts.sorterTracker),
+      _opts(opts),
       _file(std::make_shared<Sorter<Key, Value>::File>(opts.tempDir + "/" + fileName,
                                                        opts.sorterFileStats)) {
     invariant(opts.extSortAllowed);
     invariant(!opts.tempDir.empty());
     invariant(!fileName.empty());
+    if (opts.useMemPool) {
+        _memPool.emplace(makeMemPool());
+    }
 }
 
 template <typename Key, typename Value>
@@ -1143,6 +1173,15 @@ typename Sorter<Key, Value>::PersistedState Sorter<Key, Value>::persistDataForSh
     });
 
     return {_file->path().filename().string(), ranges};
+}
+
+template <typename Key, typename Value>
+Sorter<Key, Value>::File::File(std::string path, SorterFileStats* stats)
+    : _path(std::move(path)), _stats(stats) {
+    invariant(!_path.empty());
+    if (_stats && boost::filesystem::exists(_path) && boost::filesystem::is_regular_file(_path)) {
+        _stats->addSpilledDataSize(boost::filesystem::file_size(_path));
+    }
 }
 
 template <typename Key, typename Value>
@@ -1206,6 +1245,9 @@ void Sorter<Key, Value>::File::write(const char* data, std::streamsize size) {
     try {
         _file.write(data, size);
         _offset += size;
+        if (_stats) {
+            this->_stats->addSpilledDataSize(size);
+        };
     } catch (const std::system_error& ex) {
         if (ex.code() == std::errc::no_space_on_device) {
             uasserted(ErrorCodes::OutOfDiskSpace,
@@ -1275,7 +1317,7 @@ SortedFileWriter<Key, Value>::SortedFileWriter(
     : _settings(settings),
       _file(std::move(file)),
       _fileStartOffset(_file->currentOffset()),
-      _dbName(opts.dbName) {
+      _opts(opts) {
     // This should be checked by consumers, but if we get here don't allow writes.
     uassert(
         16946, "Attempting to use external sort from mongos. This is not allowed.", !isMongos());
@@ -1312,6 +1354,10 @@ void SortedFileWriter<Key, Value>::spill() {
     if (size == 0)
         return;
 
+    if (_opts.sorterFileStats) {
+        _opts.sorterFileStats->addSpilledDataSizeUncompressed(size);
+    }
+
     std::string compressed;
     snappy::Compress(outBuffer, size, &compressed);
     verify(compressed.size() <= size_t(std::numeric_limits<int32_t>::max()));
@@ -1332,7 +1378,7 @@ void SortedFileWriter<Key, Value>::spill() {
                                                         reinterpret_cast<uint8_t*>(out.get()),
                                                         protectedSizeMax,
                                                         &resultLen,
-                                                        _dbName);
+                                                        _opts.dbName);
         uassert(28842,
                 str::stream() << "Failed to compress data: " << status.toString(),
                 status.isOK());
@@ -1353,7 +1399,7 @@ SortIteratorInterface<Key, Value>* SortedFileWriter<Key, Value>::done() {
     spill();
 
     return new sorter::FileIterator<Key, Value>(
-        _file, _fileStartOffset, _file->currentOffset(), _settings, _dbName, _checksum);
+        _file, _fileStartOffset, _file->currentOffset(), _settings, _opts.dbName, _checksum);
 }
 
 template <typename Key, typename Value, typename Comparator, typename BoundMaker>
@@ -1361,7 +1407,8 @@ BoundedSorter<Key, Value, Comparator, BoundMaker>::BoundedSorter(const SortOptio
                                                                  Comparator comp,
                                                                  BoundMaker makeBound,
                                                                  bool checkInput)
-    : compare(comp),
+    : BoundedSorterInterface<Key, Value>(opts),
+      compare(comp),
       makeBound(makeBound),
       _comparePairs{compare},
       _checkInput(checkInput),
@@ -1376,7 +1423,8 @@ void BoundedSorter<Key, Value, Comparator, BoundMaker>::add(Key key, Value value
     invariant(!_done);
     // If a new value violates what we thought was our min bound, something has gone wrong.
     uassert(6369910,
-            "BoundedSorter input is too out-of-order.",
+            str::stream() << "BoundedSorter input is too out-of-order: with bound "
+                          << _min->toString() << ", did not expect input " << key.toString(),
             !_checkInput || !_min || compare(*_min, key) <= 0);
 
     // Each new item can potentially give us a tighter bound (a higher min).
@@ -1461,10 +1509,11 @@ std::pair<Key, Value> BoundedSorter<Key, Value, Comparator, BoundMaker>::next() 
         _heap.pop();
 
         auto memUsage = result.first.memUsageForSorter() + result.second.memUsageForSorter();
-        tassert(6409301,
-                "Memory usage for BoundedSorter is invalid",
-                memUsage >= 0 && static_cast<size_t>(memUsage) <= _memUsed);
-        _memUsed -= memUsage;
+        if (static_cast<int64_t>(memUsage) > static_cast<int64_t>(_memUsed)) {
+            _memUsed = 0;
+        } else {
+            _memUsed -= memUsage;
+        }
     };
 
     auto pullFromSpilled = [this, &result]() {
@@ -1519,7 +1568,7 @@ void BoundedSorter<Key, Value, Comparator, BoundMaker>::_spill() {
                           << " bytes, but did not opt in to external sorting.",
             _opts.extSortAllowed);
 
-    ++_numSpills;
+    this->_stats.incrementSpilledRanges();
 
     // Write out all the values from the heap in sorted order.
     SortedFileWriter<Key, Value> writer(_opts, _file, {});

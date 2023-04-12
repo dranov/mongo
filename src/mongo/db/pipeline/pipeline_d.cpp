@@ -42,7 +42,6 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/cached_plan.h"
 #include "mongo/db/exec/collection_scan.h"
@@ -929,8 +928,10 @@ PipelineD::supportsSort(const BucketUnpacker& bucketUnpacker,
             const CollectionScan* scan = static_cast<CollectionScan*>(root);
             if (sort.size() == 1) {
                 auto part = sort[0];
-                // Check the sort we're asking for is on time.
-                if (part.fieldPath && *part.fieldPath == bucketUnpacker.getTimeField()) {
+                // Check the sort we're asking for is on time, and that the buckets are actually
+                // ordered on time.
+                if (part.fieldPath && *part.fieldPath == bucketUnpacker.getTimeField() &&
+                    !bucketUnpacker.bucketSpec().usesExtendedRange()) {
                     // Check that the directions agree.
                     if ((scan->getDirection() == CollectionScanParams::Direction::FORWARD) ==
                         part.isAscending)
@@ -1035,6 +1036,15 @@ PipelineD::supportsSort(const BucketUnpacker& bucketUnpacker,
                     // bypass the view), so don't bother optimizing that case.
                     auto&& ixField = keyPatternIter->fieldNameStringData();
                     if (ixField != controlMinTime && ixField != controlMaxTime)
+                        return boost::none;
+
+                    // If we've inserted a date before 1-1-1970, we round the min up towards 1970,
+                    // rather then down, which has the effect of increasing the control.min.t.
+                    // This means the minimum time in the bucket is likely to be lower than
+                    // indicated and thus, actual dates may be out of order relative to what's
+                    // indicated by the bucket bounds.
+                    if (ixField == controlMinTime &&
+                        bucketUnpacker.bucketSpec().usesExtendedRange())
                         return boost::none;
 
                     if (!directionCompatible(*keyPatternIter, *sortIter))
@@ -1208,12 +1218,7 @@ PipelineD::buildInnerQueryExecutorGeneric(const MultipleCollectionAccessor& coll
     // sort optimization. We check eligibility and perform the rewrite here.
     auto [unpack, sort] = findUnpackThenSort(pipeline->_sources);
     QueryPlannerParams plannerOpts;
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-            multiversion::FeatureCompatibilityVersion::kVersion_6_0) &&
-        feature_flags::gFeatureFlagBucketUnpackWithSort.isEnabled(
-            serverGlobalParams.featureCompatibility) &&
-        unpack && sort) {
+    if (feature_flags::gFeatureFlagBucketUnpackWithSort.isEnabledAndIgnoreFCV() && unpack && sort) {
         plannerOpts.traversalPreference = createTimeSeriesTraversalPreference(unpack, sort);
     }
 
@@ -1235,12 +1240,7 @@ PipelineD::buildInnerQueryExecutorGeneric(const MultipleCollectionAccessor& coll
 
     // If this is a query on a time-series collection then it may be eligible for a post-planning
     // sort optimization. We check eligibility and perform the rewrite here.
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-            multiversion::FeatureCompatibilityVersion::kVersion_6_0) &&
-        feature_flags::gFeatureFlagBucketUnpackWithSort.isEnabled(
-            serverGlobalParams.featureCompatibility) &&
-        unpack && sort) {
+    if (feature_flags::gFeatureFlagBucketUnpackWithSort.isEnabledAndIgnoreFCV() && unpack && sort) {
         auto execImpl = dynamic_cast<PlanExecutorImpl*>(exec.get());
         if (execImpl) {
 

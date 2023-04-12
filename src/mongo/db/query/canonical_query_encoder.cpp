@@ -74,32 +74,6 @@ bool isQueryNegatingEqualToNull(const mongo::MatchExpression* tree) {
 
 namespace {
 
-// Delimiters for cache key encoding.
-const char kEncodeChildrenBegin = '[';
-const char kEncodeChildrenEnd = ']';
-const char kEncodeChildrenSeparator = ',';
-const char kEncodeCollationSection = '#';
-const char kEncodeProjectionSection = '|';
-const char kEncodeProjectionRequirementSeparator = '-';
-const char kEncodeRegexFlagsSeparator = '/';
-const char kEncodeSortSection = '~';
-const char kEncodeEngineSection = '@';
-
-// These special bytes are used in the encoding of auto-parameterized match expressions in the SBE
-// plan cache key.
-
-// Precedes the id number of a parameter marker.
-const char kEncodeParamMarker = '?';
-// Precedes the encoding of a constant when that constant has not been auto-paramterized. The
-// constant is typically encoded as a BSON type byte followed by a BSON value (without the
-// BSONElement's field name).
-const char kEncodeConstantLiteralMarker = ':';
-// Precedes a byte which encodes the bounds tightness associated with a predicate. The structure of
-// the plan (i.e. presence of filters) is affected by bounds tightness. Therefore, if different
-// parameter values can result in different tightnesses, this must be explicitly encoded into the
-// plan cache key.
-const char kEncodeBoundsTightnessDiscriminator = ':';
-
 /**
  * AppendChar provides the compiler with a type for a "appendChar(...)" member function.
  */
@@ -584,7 +558,7 @@ void encodeKeyForProj(const projection_ast::Projection* proj, StringBuilder* key
         return;
     }
 
-    std::set<std::string> requiredFields = proj->getRequiredFields();
+    auto requiredFields = proj->getRequiredFields();
 
     // If the only requirement is that $sortKey be included with some value, we just act as if the
     // entire document is needed.

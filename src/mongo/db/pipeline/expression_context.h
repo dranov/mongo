@@ -60,15 +60,6 @@ namespace mongo {
 
 class AggregateCommandRequest;
 
-/**
- * The structure ExpressionCounters encapsulates counters for match, aggregate, and other
- * expression types as seen in the end-user queries.
- */
-struct ExpressionCounters {
-    StringMap<uint64_t> aggExprCountersMap;
-    StringMap<uint64_t> matchExprCountersMap;
-};
-
 class ExpressionContext : public RefCountable {
 public:
     struct ResolvedNamespace {
@@ -118,6 +109,8 @@ public:
     struct ExpressionCounters {
         StringMap<uint64_t> aggExprCountersMap;
         StringMap<uint64_t> matchExprCountersMap;
+        StringMap<uint64_t> groupAccumulatorExprCountersMap;
+        StringMap<uint64_t> windowAccumulatorExprCountersMap;
     };
 
     /**
@@ -380,6 +373,16 @@ public:
     void incrementAggExprCounter(StringData name);
 
     /**
+     * Increment the counter for the $group accumulator expression with a given name.
+     */
+    void incrementGroupAccumulatorExprCounter(StringData name);
+
+    /**
+     * Increment the counter for the $setWindowFields accumulator expression with a given name.
+     */
+    void incrementWindowAccumulatorExprCounter(StringData name);
+
+    /**
      * Merge expression counters from the current expression context into the global maps
      * and stop counting.
      */
@@ -433,7 +436,7 @@ public:
     // Tracks the depth of nested aggregation sub-pipelines. Used to enforce depth limits.
     long long subPipelineDepth = 0;
 
-    // True if this 'ExpressionContext' object is for the inner side of a $lookup.
+    // True if this 'ExpressionContext' object is for the inner side of a $lookup or $graphLookup.
     bool inLookup = false;
 
     // If set, this will disallow use of features introduced in versions above the provided version.
@@ -486,6 +489,20 @@ public:
     // expression counting.
     bool enabledCounters = true;
 
+    // Sets or clears a flag which tells DocumentSource parsers whether any involved Collection
+    // may contain extended-range dates.
+    void setRequiresTimeseriesExtendedRangeSupport(bool v) {
+        _requiresTimeseriesExtendedRangeSupport = v;
+    }
+    bool getRequiresTimeseriesExtendedRangeSupport() const {
+        return _requiresTimeseriesExtendedRangeSupport;
+    }
+
+    // Returns true if the resolved collation of the context is simple.
+    bool isResolvedCollationSimple() const {
+        return getCollatorBSON().woCompare(CollationSpec::kSimpleSpec) == 0;
+    }
+
 protected:
     static const int kInterruptCheckPeriod = 128;
 
@@ -509,6 +526,8 @@ protected:
     int _interruptCounter = kInterruptCheckPeriod;
 
     bool _isCappedDelete = false;
+
+    bool _requiresTimeseriesExtendedRangeSupport = false;
 
 private:
     boost::optional<ExpressionCounters> _expressionCounters = boost::none;

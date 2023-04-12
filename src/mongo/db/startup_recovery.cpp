@@ -42,7 +42,7 @@
 #include "mongo/db/commands/feature_compatibility_version_document_gen.h"
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index_builds_coordinator.h"
@@ -54,6 +54,7 @@
 #include "mongo/db/repl_set_member_in_standalone_mode.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/db/timeseries/timeseries_extended_range.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
@@ -161,6 +162,10 @@ bool checkIdIndexExists(OperationContext* opCtx, const CollectionPtr& coll) {
 Status buildMissingIdIndex(OperationContext* opCtx, Collection* collection) {
     LOGV2(4805002, "Building missing _id index", logAttrs(*collection));
     MultiIndexBlock indexer;
+    // This method is called in startup recovery so we can safely build the id index in foreground
+    // mode. This prevents us from yielding a MODE_X lock (which is disallowed).
+    indexer.setIndexBuildMethod(IndexBuildMethod::kForeground);
+
     ScopeGuard abortOnExit([&] {
         CollectionWriter collWriter(collection);
         indexer.abortIndexBuild(opCtx, collWriter, MultiIndexBlock::kNoopOnCleanUpFn);
@@ -245,6 +250,11 @@ Status ensureCollectionProperties(OperationContext* opCtx,
             } else {
                 return downgradeError;
             }
+        }
+
+        if (coll->getTimeseriesOptions() &&
+            timeseries::collectionMayRequireExtendedRangeSupport(opCtx, coll)) {
+            coll->setRequiresTimeseriesExtendedRangeSupport(opCtx);
         }
     }
     return Status::OK();

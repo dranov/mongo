@@ -57,6 +57,7 @@ include:
 - filename: etc/evergreen_yml_components/variants/task_generation.yml
 - filename: etc/evergreen_yml_components/variants/sanitizer.yml
 - filename: etc/evergreen_yml_components/variants/in_memory.yml
+- filename: etc/evergreen_yml_components/variants/ninja.yml
 
 variables:
 - &libfuzzertests
@@ -187,13 +188,8 @@ variables:
   - name: .crypt
   - name: .publish_crypt
   - name: unittest_shell_hang_analyzer_gen
-  - name: test_packages
-    distros:
-    - ubuntu2004-package
-  - name: selinux_rhel7_enterprise
-  - name: .publish
-    distros:
-    - rhel70-small
+  # TODO: BF-24515 re-enable when build failure cause determined and resolved
+  # - name: selinux_rhel7_enterprise
   - name: generate_buildid_to_debug_symbols_mapping
 
 
@@ -340,26 +336,6 @@ buildvariants:
     timeout_secs: 345600 # 4 days
   tasks:
   - name: tla_plus
-
-- name: enterprise-rhel80-ninja
-  display_name: "Ninja Build: RHEL 8.0"
-  cron: "0 4 * * *" # From the ${project_nightly_cron} parameter.
-  modules:
-  - enterprise
-  run_on:
-  - rhel80-small
-  stepback: false
-  expansions:
-    compile_flags: --ssl --ocsp-stapling=off MONGO_DISTMOD=rhel80 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --link-model=dynamic
-    repo_edition: enterprise
-    has_packages: false
-  tasks:
-  - name: compile_ninja_next_TG
-    distros:
-    - rhel80-build
-  - name: compile_ninja_TG
-    distros:
-    - rhel80-build
 
 - &enterprise-rhel80-dynamic-v4gcc-debug-experimental-template
   name: enterprise-rhel80-dynamic-v4gcc-debug-experimental
@@ -662,7 +638,7 @@ buildvariants:
     target_resmoke_time: 10
     max_sub_suites: 5
     large_distro_name: rhel80-medium
-    burn_in_tag_buildvariants: enterprise-rhel-80-64-bit-inmem linux-64-duroff enterprise-rhel-80-64-bit-multiversion
+    burn_in_tag_buildvariants: enterprise-rhel-80-64-bit-dynamic-required
     num_scons_link_jobs_available: 0.99
     test_flags: >-
       --mongodSetParameters="{roundtripBsonColumnOnValidate: true}"
@@ -981,7 +957,7 @@ buildvariants:
     # To force disable feature flags even on the all feature flags variant, please use this file:
     # buildscripts/resmokeconfig/fully_disabled_feature_flags.yml
     test_flags: >-
-      --runAllFeatureFlagTests
+      --additionalFeatureFlagsFile all_feature_flags.txt
       --excludeWithAnyTags=incompatible_with_windows_tls
       --excludeWithAnyTags=incompatible_with_shard_merge
   tasks:
@@ -1034,21 +1010,6 @@ buildvariants:
 #    - name: compile_run_and_archive_dbtest_TG
 #      distros:
 #        - windows-vsCurrent-xlarge
-
-- name: enterprise-windows-ninja
-  display_name: "Ninja Build: Enterprise Windows"
-  cron: "0 4 * * *" # From the ${project_nightly_cron} parameter.
-  modules:
-  - enterprise
-  expansions:
-    compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(bc <<< "$(grep -c '^processor' /proc/cpuinfo) / 1.5")  --win-version-min=win10
-  tasks:
-  - name: compile_ninja_next_TG
-    distros:
-    - windows-vsCurrent-large
-  - name: compile_ninja_TG
-    distros:
-    - windows-vsCurrent-large
 
 - name: enterprise-windows-cxx20-debug-experimental
   display_name: "~ Enterprise Windows C++20 DEBUG"
@@ -1168,20 +1129,7 @@ buildvariants:
   - name: .ssl
   - name: .stitch
   - name: unittest_shell_hang_analyzer_gen
-
-- name: macos-enterprise-ninja
-  display_name: "Ninja Build: macOS Enterprise"
-  cron: "0 4 * * *" # From the ${project_nightly_cron} parameter.
-  modules:
-  - enterprise
-  run_on:
-  - macos-1100
-  expansions:
-    compile_env: DEVELOPER_DIR=/Applications/Xcode13.app
-    compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --libc++ --variables-files=etc/scons/xcode_macosx.vars
-  tasks:
-  - name: compile_ninja_next_TG
-  - name: compile_ninja_TG
+  - name: generate_buildid_to_debug_symbols_mapping
 
 - name: enterprise-macos-rosetta-2
   display_name: "Enterprise macOS Via Rosetta 2"
@@ -1265,12 +1213,8 @@ buildvariants:
   - name: replica_sets_jscore_passthrough
   - name: sasl
   - name: push
-    distros:
-    - rhel70-small
   - name: .crypt
   - name: .publish_crypt
-    distros:
-    - rhel70-small
 
 ###########################################
 #          Embedded SDK buildvariants     #
@@ -1353,7 +1297,9 @@ buildvariants:
     idle_timeout_factor: 1.5
     exec_timeout_factor: 1.5
     large_distro_name: rhel80-medium
-    burn_in_tag_buildvariants: enterprise-rhel-80-64-bit-inmem linux-64-duroff enterprise-rhel-80-64-bit-multiversion
+    burn_in_tag_buildvariants: enterprise-rhel-80-64-bit-dynamic-required
+    burn_in_tag_compile_distro: rhel80-xlarge
+    burn_in_tag_compile_task_group_name: compile_and_archive_dist_test_TG
     num_scons_link_jobs_available: 0.99
   tasks:
   - name: compile_test_and_package_parallel_core_stream_TG
@@ -1472,24 +1418,7 @@ buildvariants:
   - name: server_selection_json_test_TG
     distros:
     - rhel80-xlarge
-
-- name: enterprise-rhel-80-64-bit-dynamic-required-ninja
-  display_name: "Ninja Build: Enterprise RHEL 8.0"
-  cron: "0 4 * * *" # From the ${project_nightly_cron} parameter.
-  modules:
-  - enterprise
-  run_on:
-  - rhel80-small
-  expansions:
-    compile_flags: --ssl MONGO_DISTMOD=rhel80 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --link-model=dynamic
-    has_packages: false
-  tasks:
-  - name: compile_ninja_next_TG
-    distros:
-    - rhel80-xlarge
-  - name: compile_ninja_TG
-    distros:
-    - rhel80-xlarge
+  - name: generate_buildid_to_debug_symbols_mapping
 
 - &enterprise-rhel-80-64-bit-dynamic-all-feature-flags-required-template
   name: enterprise-rhel-80-64-bit-dynamic-all-feature-flags-required
@@ -1518,7 +1447,7 @@ buildvariants:
     # To force disable feature flags even on the all feature flags variant, please use this file:
     # buildscripts/resmokeconfig/fully_disabled_feature_flags.yml
     test_flags: >-
-      --runAllFeatureFlagTests
+      --additionalFeatureFlagsFile all_feature_flags.txt
       --excludeWithAnyTags=incompatible_with_shard_merge
   tasks: &enterprise-rhel-80-64-bit-dynamic-all-feature-flags-tasks
   - name: cqf
@@ -1619,6 +1548,7 @@ buildvariants:
 #  - name: server_selection_json_test_TG
 #    distros:
 #      - rhel80-large
+  - name: generate_buildid_to_debug_symbols_mapping
 
 - &enterprise-rhel-80-64-bit-dynamic-classic-engine
   name: enterprise-rhel-80-64-bit-dynamic-classic-engine
@@ -1642,7 +1572,9 @@ buildvariants:
     target_resmoke_time: 10
     max_sub_suites: 5
     large_distro_name: rhel80-medium
-    burn_in_tag_buildvariants: enterprise-rhel-80-64-bit-inmem linux-64-duroff enterprise-rhel-80-64-bit-multiversion
+    burn_in_tag_buildvariants: enterprise-rhel-80-64-bit-dynamic-required
+    burn_in_tag_compile_distro: rhel80-xlarge
+    burn_in_tag_compile_task_group_name: compile_and_archive_dist_test_TG
     num_scons_link_jobs_available: 0.99
     test_flags: >-
       --mongodSetParameters="{internalQueryForceClassicEngine: true}"
@@ -1869,7 +1801,7 @@ buildvariants:
     <<: *enterprise-rhel-80-64-bit-multiversion-expansions-template
     # No feature flag tests since they aren't compatible with the older binaries.
     test_flags: >-
-      --runAllFeatureFlagsNoTests
+      --runNoFeatureFlagTests
       --excludeWithAnyTags=incompatible_with_shard_merge
   tasks:
   - name: compile_test_and_package_parallel_core_stream_TG
@@ -1914,6 +1846,9 @@ buildvariants:
     test_flags: >-
       --excludeWithAnyTags=future_git_tag_incompatible
   tasks:
+  - name: version_expansions_gen
+    distros:
+    - rhel80-small
   - name: compile_test_and_package_parallel_core_stream_TG
     distros:
     - rhel80-xlarge
@@ -2005,10 +1940,8 @@ buildvariants:
   - name: sharding_auth_gen
   - name: snmp
   - name: .stitch
-  - name: test_packages
-    distros:
-    - ubuntu2004-package
-  - name: selinux_rhel8_enterprise
+  # TODO: BF-24515 re-enable when build failure cause determined and resolved
+  #- name: selinux_rhel8_enterprise
   - name: generate_buildid_to_debug_symbols_mapping
 
 
@@ -2142,6 +2075,8 @@ buildvariants:
     multiversion_architecture: s390x
     multiversion_edition: enterprise
     num_scons_link_jobs_available: 0.99
+    test_flags: >-
+      --excludeWithAnyTags=incompatible_with_s390x
   tasks:
   - name: compile_test_and_package_serial_TG
     distros:
@@ -2201,11 +2136,12 @@ buildvariants:
   - name: .read_write_concern !.write !.aggregation
   - name: replica_sets_jscore_passthrough
   - name: replica_sets_large_txns_format_jscore_passthrough
-  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_gen
   - name: sharding_gen
   - name: sharding_auth_gen
   - name: .stitch
   - name: unittest_shell_hang_analyzer_gen
+  - name: generate_buildid_to_debug_symbols_mapping
 
 ################################
 # storage engine buildvariants #
@@ -2306,7 +2242,7 @@ buildvariants:
     # buildscripts/resmokeconfig/fully_disabled_feature_flags.yml
     large_distro_name: rhel80-build
     test_flags: >-
-      --runAllFeatureFlagTests
+      --additionalFeatureFlagsFile all_feature_flags.txt
       --excludeWithAnyTags=incompatible_with_shard_merge
     separate_debug: off
   tasks:
@@ -2450,7 +2386,7 @@ buildvariants:
     test_flags: >-
       --excludeWithAnyTags=requires_ocsp_stapling
       --excludeWithAnyTags=incompatible_with_shard_merge
-      --runAllFeatureFlagTests
+      --additionalFeatureFlagsFile all_feature_flags.txt
     multiversion_platform: rhel80
     multiversion_edition: enterprise
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under UBSAN build.
@@ -2608,6 +2544,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_txns
   - name: unittest_shell_hang_analyzer_gen
+  - name: generate_buildid_to_debug_symbols_mapping
 
 - <<: *rhel80-debug-aubsan-lite-required-template
   name: rhel80-debug-aubsan-lite-all-feature-flags-required
@@ -2625,14 +2562,7 @@ buildvariants:
     test_flags: >-
       --excludeWithAnyTags=requires_ocsp_stapling
       --excludeWithAnyTags=incompatible_with_shard_merge
-      --runAllFeatureFlagTests
-    resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
-    hang_analyzer_dump_core: false
-    scons_cache_scope: shared
-    scons_cache_mode: all
-    max_sub_suites: 3
-    num_scons_link_jobs_available: 0.99
-    separate_debug: off
+      --additionalFeatureFlagsFile all_feature_flags.txt
   tasks:
   - name: compile_test_and_package_parallel_core_stream_TG
     distros:
@@ -2647,6 +2577,7 @@ buildvariants:
 #    distros:
 #      - rhel80-xlarge
 #  - name: unittest_shell_hang_analyzer_gen
+  - name: generate_buildid_to_debug_symbols_mapping
 
 - name: enterprise-rhel80-debug-tsan
   display_name: ~ TSAN Enterprise RHEL 8.0 DEBUG
@@ -3015,29 +2946,6 @@ buildvariants:
   tasks:
   - name: selected_tests_gen
 
-- <<: *enterprise-rhel-80-64-bit-dynamic-required-template
-  name: commit-queue
-  display_name: "~ Commit Queue"
-  cron: "0 4 * * 0" # From the ${project_weekly_cron} parameter
-  stepback: false
-  tasks:
-  - name: compile_test_and_package_parallel_core_stream_TG
-    distros:
-    - rhel80-xlarge-commitqueue
-  - name: compile_test_and_package_parallel_unittest_stream_TG
-    distros:
-    - rhel80-xlarge-commitqueue
-  - name: compile_test_and_package_parallel_dbtest_stream_TG
-    distros:
-    - rhel80-xlarge-commitqueue
-  - name: jsCore
-    distros:
-    - rhel80-xlarge-commitqueue
-  - name: .lint
-  - name: test_api_version_compatibility
-  - name: validate_commit_message
-  - name: check_feature_flag_tags
-
 - name: windows-dynamic-visibility-test
   display_name: "~ Shared Library Windows (visibility test)"
   cron: "0 4 * * *" # From the ${project_nightly_cron} parameter.
@@ -3082,7 +2990,7 @@ buildvariants:
     target_resmoke_time: 30
     max_sub_suites: 3
     test_flags: >-
-      --runAllFeatureFlagTests
+      --additionalFeatureFlagsFile all_feature_flags.txt
       --excludeWithAnyTags=resource_intensive
       --excludeWithAnyTags=incompatible_with_shard_merge
 

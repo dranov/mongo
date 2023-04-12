@@ -43,8 +43,8 @@
 #include "mongo/db/catalog/list_indexes.h"
 #include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_state.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -116,7 +116,10 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
                       str::stream() << "Source collection " << source.ns() << " does not exist");
     }
 
-    if (sourceColl->getCollectionOptions().encryptedFieldConfig) {
+    if (sourceColl->getCollectionOptions().encryptedFieldConfig &&
+        !AuthorizationSession::get(opCtx->getClient())
+             ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                ActionType::setUserWriteBlockMode)) {
         return Status(ErrorCodes::IllegalOperation, "Cannot rename an encrypted collection");
     }
 
@@ -129,7 +132,10 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
             return Status(ErrorCodes::NamespaceExists,
                           str::stream() << "a view already exists with that name: " << target);
     } else {
-        if (targetColl->getCollectionOptions().encryptedFieldConfig) {
+        if (targetColl->getCollectionOptions().encryptedFieldConfig &&
+            !AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                    ActionType::setUserWriteBlockMode)) {
             return Status(ErrorCodes::IllegalOperation,
                           "Cannot rename to an existing encrypted collection");
         }

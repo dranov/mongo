@@ -142,13 +142,19 @@ REGISTER_DOCUMENT_SOURCE(sort,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceSort::createFromBson,
                          AllowedWithApiStrict::kAlways);
+
 REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(
     _internalBoundedSort,
     LiteParsedDocumentSourceDefault::parse,
     DocumentSourceSort::parseBoundedSort,
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagBucketUnpackWithSort.getVersion(),
+    ::mongo::getTestCommandsEnabled() ? AllowedWithApiStrict::kNeverInVersion1
+                                      : AllowedWithApiStrict::kInternal,
+    ::mongo::getTestCommandsEnabled() ? AllowedWithClientType::kAny
+                                      : AllowedWithClientType::kInternal,
+    // We don't expect mongos or clients to produce this stage:
+    // We only generate it after multiplanning, which means only within one mongod process.
+    // So, we should be allowed to parse this stage regardless of FCV.
+    boost::none /*minVersion*/,
     feature_flags::gFeatureFlagBucketUnpackWithSort.isEnabledAndIgnoreFCV());
 
 DocumentSource::GetNextResult::ReturnStatus DocumentSourceSort::timeSorterPeek() {
@@ -301,8 +307,8 @@ void DocumentSourceSort::serializeToArray(
         if (explain >= ExplainOptions::Verbosity::kExecStats) {
             mutDoc["totalDataSizeSortedBytesEstimate"] =
                 Value(static_cast<long long>(_timeSorter->totalDataSizeBytes()));
-            mutDoc["usedDisk"] = Value(_timeSorter->numSpills() > 0);
-            mutDoc["spills"] = Value(static_cast<long long>(_timeSorter->numSpills()));
+            mutDoc["usedDisk"] = Value(_timeSorter->stats().spilledRanges() > 0);
+            mutDoc["spills"] = Value(static_cast<long long>(_timeSorter->stats().spilledRanges()));
         }
 
         array.push_back(Value{mutDoc.freeze()});
@@ -482,6 +488,10 @@ intrusive_ptr<DocumentSourceSort> DocumentSourceSort::parseBoundedSort(
     BSONElement key = args["sortKey"];
     uassert(6369904, "$_internalBoundedSort sortKey must be an object", key.type() == Object);
 
+    // Empty sort pattern is not allowed for the bounded sort.
+    uassert(6900501,
+            "$_internalBoundedSort stage must have at least one sort key",
+            !key.embeddedObject().isEmpty());
     SortPattern pat{key.embeddedObject(), expCtx};
 
     {
@@ -649,7 +659,7 @@ boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceSort::distri
 }
 
 bool DocumentSourceSort::canRunInParallelBeforeWriteStage(
-    const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const {
+    const OrderedPathSet& nameOfShardKeyFieldsUponEntryToStage) const {
     // This is an interesting special case. If there are no further stages which require merging the
     // streams into one, a $sort should not require it. This is only the case because the sort order
     // doesn't matter for a pipeline ending with a write stage. We may encounter it here as an

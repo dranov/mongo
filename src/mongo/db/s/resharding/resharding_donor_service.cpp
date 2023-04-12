@@ -37,7 +37,7 @@
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
@@ -55,6 +55,7 @@
 #include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/write_block_bypass.h"
 #include "mongo/db/write_concern_options.h"
@@ -65,6 +66,7 @@
 
 namespace mongo {
 
+MONGO_FAIL_POINT_DEFINE(reshardingPauseDonorBeforeCatalogCacheRefresh);
 MONGO_FAIL_POINT_DEFINE(reshardingDonorFailsAfterTransitionToDonatingOplogEntries);
 MONGO_FAIL_POINT_DEFINE(removeDonorDocFailpoint);
 
@@ -567,6 +569,8 @@ void ReshardingDonorService::DonorStateMachine::
     // with a SnapshotUnavailable error response.
     {
         auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+        reshardingPauseDonorBeforeCatalogCacheRefresh.pauseWhileSet(opCtx.get());
+
         _externalState->refreshCatalogCache(opCtx.get(), _metadata.getTempReshardingNss());
         _externalState->waitForCollectionFlush(opCtx.get(), _metadata.getTempReshardingNss());
     }
@@ -795,7 +799,7 @@ void ReshardingDonorService::DonorStateMachine::_dropOriginalCollectionThenTrans
         // Allow bypassing user write blocking. The check has already been performed on the
         // db-primary shard's ReshardCollectionCoordinator.
         WriteBlockBypass::get(opCtx.get()).set(true);
-        resharding::data_copy::ensureCollectionDropped(
+        mongo::sharding_ddl_util::ensureCollectionDroppedNoChangeEvent(
             opCtx.get(), _metadata.getSourceNss(), _metadata.getSourceUUID());
     }
 

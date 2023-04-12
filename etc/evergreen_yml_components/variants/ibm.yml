@@ -50,11 +50,7 @@ buildvariants:
   - name: .stitch
   - name: .crypt
   - name: .publish_crypt
-    distros:
-    - rhel70-small
   - name: .publish
-    distros:
-    - rhel70-small
   - name: generate_buildid_to_debug_symbols_mapping
 
 - name: enterprise-rhel-72-s390x
@@ -63,7 +59,7 @@ buildvariants:
   - enterprise
   run_on:
   - rhel72-zseries-test
-  cron: "0 0 1 1 *" # Every year at Jan 1st. 0000 UTC
+  cron: "0 4 * * 0"
   stepback: false
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
@@ -83,6 +79,8 @@ buildvariants:
     multiversion_platform: rhel72
     multiversion_architecture: s390x
     multiversion_edition: enterprise
+    test_flags: >-
+      --excludeWithAnyTags=incompatible_with_s390x
   tasks:
   - name: compile_test_and_package_serial_TG
     distros:
@@ -106,11 +104,7 @@ buildvariants:
   - name: .stitch
   - name: .crypt
   - name: .publish_crypt
-    distros:
-    - rhel70-small
   - name: .publish
-    distros:
-    - rhel70-small
   - name: generate_buildid_to_debug_symbols_mapping
 
 - name: enterprise-rhel-83-s390x
@@ -119,7 +113,7 @@ buildvariants:
   - enterprise
   run_on:
   - rhel83-zseries-small
-  cron: "0 0 1 1 *" # Every year at Jan 1st. 0000 UTC
+  cron: "0 4 * * 0"
   stepback: false
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
@@ -139,6 +133,8 @@ buildvariants:
     multiversion_platform: rhel83
     multiversion_architecture: s390x
     multiversion_edition: enterprise
+    test_flags: >-
+      --excludeWithAnyTags=incompatible_with_s390x
   tasks:
   - name: compile_test_and_package_serial_TG
     distros:
@@ -162,9 +158,5 @@ buildvariants:
   - name: .stitch
   - name: .crypt
   - name: .publish_crypt
-    distros:
-    - rhel80-small
   - name: .publish
-    distros:
-    - rhel80-small
   - name: generate_buildid_to_debug_symbols_mapping

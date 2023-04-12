@@ -7,7 +7,7 @@
 load("jstests/sharding/libs/zone_changes_util.js");
 load("jstests/sharding/libs/find_chunks_util.js");
 
-let st = new ShardingTest({shards: 3});
+const st = new ShardingTest({shards: 3, other: {chunkSize: 1, enableAutoSplitter: false}});
 let primaryShard = st.shard0;
 let dbName = "test";
 let testDB = st.s.getDB(dbName);
@@ -16,8 +16,8 @@ let coll = testDB.range;
 let ns = coll.getFullName();
 let shardKey = {x: 1};
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, primaryShard.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: primaryShard.shardName}));
 
 jsTest.log("Shard the collection and create chunks.");
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: shardKey}));
@@ -26,8 +26,15 @@ assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: 0}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: 10}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: 20}}));
 
+const bigString = 'X'.repeat(1024 * 1024);  // 1MB
 jsTest.log("Insert docs (one for each chunk) and check that they end up on the primary shard.");
-let docs = [{x: -15}, {x: -5}, {x: 5}, {x: 15}, {x: 25}];
+let docs = [
+    {x: -15, s: bigString},
+    {x: -5, s: bigString},
+    {x: 5, s: bigString},
+    {x: 15, s: bigString},
+    {x: 25, s: bigString}
+];
 assert.eq(docs.length, findChunksUtil.countChunksForNs(configDB, ns));
 assert.commandWorked(coll.insert(docs));
 assert.eq(docs.length, primaryShard.getCollection(ns).count());

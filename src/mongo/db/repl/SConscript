@@ -60,6 +60,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/local_oplog_info',
         '$BUILD_DIR/mongo/db/catalog/multi_index_block',
         '$BUILD_DIR/mongo/db/commands/feature_compatibility_parsers',
+        '$BUILD_DIR/mongo/db/concurrency/exception_util',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/dbdirectclient',
         '$BUILD_DIR/mongo/db/dbhelpers',
@@ -117,7 +118,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/dbhelpers',
-        '$BUILD_DIR/mongo/db/index/index_descriptor',
+        '$BUILD_DIR/mongo/db/index/index_access_method',
         '$BUILD_DIR/mongo/db/query_exec',
         '$BUILD_DIR/mongo/util/fail_point',
         'oplog',
@@ -137,7 +138,6 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/connection_pool',
         '$BUILD_DIR/mongo/client/fetcher',
-        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
@@ -155,6 +155,7 @@ env.Library(
         'sync_source_resolver',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/concurrency/exception_util',
         '$BUILD_DIR/mongo/db/op_observer',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
         'repl_server_parameters',
@@ -246,6 +247,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/catalog/multi_index_block',
         '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/db/concurrency/exception_util',
         '$BUILD_DIR/mongo/db/dbhelpers',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/multitenancy',
@@ -587,7 +589,6 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/query_exec',
         '$BUILD_DIR/mongo/db/stats/timer_stats',
@@ -605,6 +606,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/mongod_fsync',
+        '$BUILD_DIR/mongo/db/concurrency/exception_util',
         '$BUILD_DIR/mongo/db/storage/storage_control',
         'repl_server_parameters',
         'replication_auth',
@@ -701,7 +703,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/index/index_descriptor',
+        '$BUILD_DIR/mongo/db/index/index_access_method',
         '$BUILD_DIR/mongo/db/kill_sessions_local',
         '$BUILD_DIR/mongo/db/mongod_options',
         '$BUILD_DIR/mongo/db/prepare_conflict_tracker',
@@ -731,6 +733,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/storage/journal_flusher',
         '$BUILD_DIR/mongo/idl/server_parameter',
+        'delayable_timeout_callback',
         'repl_server_parameters',
         'replica_set_aware_service',
         'split_horizon',
@@ -1349,6 +1352,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/catalog_raii",
+        "$BUILD_DIR/mongo/db/concurrency/exception_util",
         "$BUILD_DIR/mongo/db/dbhelpers",
         "$BUILD_DIR/mongo/db/namespace_string",
         '$BUILD_DIR/mongo/db/service_context',
@@ -1378,6 +1382,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/client/clientdriver_network',
+        '$BUILD_DIR/mongo/db/concurrency/exception_util',
         '$BUILD_DIR/mongo/db/multitenancy',
         '$BUILD_DIR/mongo/db/ops/write_ops_exec',
         '$BUILD_DIR/mongo/db/pipeline/process_interface/mongo_process_interface',
@@ -1429,6 +1434,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/catalog/local_oplog_info',
+        '$BUILD_DIR/mongo/db/concurrency/exception_util',
     ],
 )
 
@@ -1447,6 +1453,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         "$BUILD_DIR/mongo/db/catalog/local_oplog_info",
+        "$BUILD_DIR/mongo/db/concurrency/exception_util",
         "$BUILD_DIR/mongo/db/index_builds_coordinator_interface",
     ],
 )
@@ -1612,6 +1619,7 @@ if wiredtiger:
             'abstract_async_component_test.cpp',
             'apply_ops_test.cpp',
             'check_quorum_for_config_change_test.cpp',
+            'delayable_timeout_callback_test.cpp',
             'drop_pending_collection_reaper_test.cpp',
             'idempotency_document_structure_test.cpp',
             'idempotency_update_sequence_test.cpp',
@@ -1672,7 +1680,7 @@ if wiredtiger:
             '$BUILD_DIR/mongo/db/commands/mongod_fcv',
             '$BUILD_DIR/mongo/db/commands/txn_cmd_request',
             '$BUILD_DIR/mongo/db/dbdirectclient',
-            '$BUILD_DIR/mongo/db/index/index_access_methods',
+            '$BUILD_DIR/mongo/db/index/index_access_method',
             '$BUILD_DIR/mongo/db/index_build_entry_helpers',
             '$BUILD_DIR/mongo/db/index_builds_coordinator_mongod',
             '$BUILD_DIR/mongo/db/logical_session_id_helpers',
@@ -1701,6 +1709,7 @@ if wiredtiger:
             '$BUILD_DIR/mongo/util/concurrency/thread_pool',
             'abstract_async_component',
             'data_replicator_external_state_mock',
+            'delayable_timeout_callback',
             'drop_pending_collection_reaper',
             'idempotency_test_fixture',
             'idempotency_test_util',
@@ -1955,7 +1964,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
+        '$BUILD_DIR/mongo/db/concurrency/exception_util',
         'abstract_async_component',
         'cloner_utils',
         'oplog',
@@ -1975,5 +1984,16 @@ env.Library(
         '$BUILD_DIR/mongo/db/logical_session_id',
         '$BUILD_DIR/mongo/idl/idl_parser',
         'oplog_entry',
+    ],
+)
+
+env.Library(
+    target='delayable_timeout_callback',
+    source=[
+        'delayable_timeout_callback.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/executor/task_executor_interface',
     ],
 )

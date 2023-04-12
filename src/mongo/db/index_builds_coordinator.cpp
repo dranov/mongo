@@ -39,9 +39,9 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_build_entry_gen.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
@@ -106,6 +106,7 @@ constexpr StringData kAbortIndexBuildFieldName = "abortIndexBuild"_sd;
 constexpr StringData kIndexesFieldName = "indexes"_sd;
 constexpr StringData kKeyFieldName = "key"_sd;
 constexpr StringData kUniqueFieldName = "unique"_sd;
+constexpr StringData kPrepareUniqueFieldName = "prepareUnique"_sd;
 
 /**
  * Checks if unique index specification is compatible with sharding configuration.
@@ -121,9 +122,9 @@ void checkShardKeyRestrictions(OperationContext* opCtx,
 
     const ShardKeyPattern shardKeyPattern(collDesc.getKeyPattern());
     uassert(ErrorCodes::CannotCreateIndex,
-            str::stream() << "cannot create unique index over " << newIdxKey
-                          << " with shard key pattern " << shardKeyPattern.toBSON(),
-            shardKeyPattern.isUniqueIndexCompatible(newIdxKey));
+            str::stream() << "cannot create index with 'unique' or 'prepareUnique' option over "
+                          << newIdxKey << " with shard key pattern " << shardKeyPattern.toBSON(),
+            shardKeyPattern.isIndexUniquenessCompatible(newIdxKey));
 }
 
 /**
@@ -185,6 +186,12 @@ void removeIndexBuildEntryAfterCommitOrAbort(OperationContext* opCtx,
 
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (!replCoord->canAcceptWritesFor(opCtx, dbAndUUID)) {
+        return;
+    }
+
+    if (replCoord->getSettings().shouldRecoverFromOplogAsStandalone()) {
+        // Writes to the 'config.system.indexBuilds' collection are replicated and the index entry
+        // will be removed when the delete oplog entry is replayed at a later time.
         return;
     }
 
@@ -1959,10 +1966,41 @@ IndexBuildsCoordinator::PostSetupAction IndexBuildsCoordinator::_setUpIndexBuild
     std::shared_ptr<ReplIndexBuildState> replState,
     Timestamp startTimestamp,
     const IndexBuildOptions& indexBuildOptions) {
-    const NamespaceStringOrUUID nssOrUuid{replState->dbName, replState->collectionUUID};
+    auto [dbLock, collLock, rstl] = [&] {
+        while (true) {
+            Lock::DBLock dbLock{opCtx, replState->dbName, MODE_IX};
 
-    AutoGetCollection coll(opCtx, nssOrUuid, MODE_X);
-    CollectionWriter collection(opCtx, coll);
+            // Unlock the RSTL to avoid deadlocks with prepared transactions and replication state
+            // transitions. See SERVER-71191.
+            unlockRSTL(opCtx);
+
+            Lock::CollectionLock collLock{
+                opCtx, {replState->dbName, replState->collectionUUID}, MODE_X};
+            repl::ReplicationStateTransitionLockGuard rstl{
+                opCtx, MODE_IX, repl::ReplicationStateTransitionLockGuard::EnqueueOnly{}};
+
+            try {
+                // Since this thread is not killable by state transitions, this deadline is
+                // effectively the longest period of time we can block a state transition. State
+                // transitions are infrequent, but need to happen quickly. It should be okay to set
+                // this to a low value because the RSTL is rarely contended and, if this does time
+                // out, we will retry and reacquire the RSTL again without a deadline.
+                rstl.waitForLockUntil(Date_t::now() + Milliseconds{10});
+            } catch (const ExceptionFor<ErrorCodes::LockTimeout>&) {
+                // We weren't able to re-acquire the RSTL within the timeout, which means there is
+                // an active state transition. Release our locks and try again from the beginning.
+                LOGV2(7119100,
+                      "Unable to acquire RSTL for index build setup within deadline, releasing "
+                      "locks and trying again",
+                      "buildUUID"_attr = replState->buildUUID);
+                continue;
+            }
+
+            return std::make_tuple(std::move(dbLock), std::move(collLock), std::move(rstl));
+        }
+    }();
+
+    CollectionWriter collection(opCtx, replState->collectionUUID);
     CollectionShardingState::get(opCtx, collection->ns())->checkShardVersionOrThrow(opCtx);
 
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
@@ -2643,8 +2681,6 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
     // Need to return the collection lock back to exclusive mode to complete the index build.
     const NamespaceStringOrUUID dbAndUUID(replState->dbName, replState->collectionUUID);
     Lock::CollectionLock collLock(opCtx, dbAndUUID, MODE_X);
-    AutoGetCollection indexBuildEntryColl(
-        opCtx, NamespaceString::kIndexBuildEntryNamespace, MODE_IX);
 
     // If we can't acquire the RSTL within a given time period, there is an active state transition
     // and we should release our locks and try again. We would otherwise introduce a deadlock with
@@ -2665,6 +2701,9 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
     } catch (const ExceptionFor<ErrorCodes::LockTimeout>&) {
         return CommitResult::kLockTimeout;
     }
+
+    AutoGetCollection indexBuildEntryColl(
+        opCtx, NamespaceString::kIndexBuildEntryNamespace, MODE_IX);
 
     // If we are no longer primary after receiving a commit quorum, we must restart and wait for a
     // new signal from a new primary because we cannot commit. Note that two-phase index builds can
@@ -2943,8 +2982,23 @@ std::vector<BSONObj> IndexBuildsCoordinator::prepareSpecListForCreate(
 
     // During secondary oplog application, the index specs have already been normalized in the
     // oplog entries read from the primary. We should not be modifying the specs any further.
+    auto indexCatalog = collection->getIndexCatalog();
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (!replCoord->canAcceptWritesFor(opCtx, nss)) {
+        // A secondary node with a subset of the indexes already built will not vote for the commit
+        // quorum, which can stall the index build indefinitely on a replica set.
+        auto specsToBuild = indexCatalog->removeExistingIndexes(
+            opCtx, collection, indexSpecs, /*removeIndexBuildsToo=*/true);
+        if (indexSpecs.size() != specsToBuild.size()) {
+            LOGV2_WARNING(7176900,
+                          "Secondary node already has a subset of indexes built and will not "
+                          "participate in voting towards the commit quorum. Use the "
+                          "'setIndexCommitQuorum' command to adjust the commit quorum accordingly",
+                          logAttrs(nss),
+                          logAttrs(collection->uuid()),
+                          "requestedSpecs"_attr = indexSpecs,
+                          "specsToBuild"_attr = specsToBuild);
+        }
         return indexSpecs;
     }
 
@@ -2952,13 +3006,12 @@ std::vector<BSONObj> IndexBuildsCoordinator::prepareSpecListForCreate(
     auto normalSpecs = normalizeIndexSpecs(opCtx, collection, indexSpecs);
 
     // Remove any index specifications which already exist in the catalog.
-    auto indexCatalog = collection->getIndexCatalog();
     auto resultSpecs = indexCatalog->removeExistingIndexes(
         opCtx, collection, normalSpecs, true /*removeIndexBuildsToo*/);
 
     // Verify that each spec is compatible with the collection's sharding state.
     for (const BSONObj& spec : resultSpecs) {
-        if (spec[kUniqueFieldName].trueValue()) {
+        if (spec[kUniqueFieldName].trueValue() || spec[kPrepareUniqueFieldName].trueValue()) {
             checkShardKeyRestrictions(opCtx, nss, spec[kKeyFieldName].Obj());
         }
     }
@@ -2966,6 +3019,7 @@ std::vector<BSONObj> IndexBuildsCoordinator::prepareSpecListForCreate(
     return resultSpecs;
 }
 
+// Returns normalized versions of 'indexSpecs' for the catalog.
 std::vector<BSONObj> IndexBuildsCoordinator::normalizeIndexSpecs(
     OperationContext* opCtx,
     const CollectionPtr& collection,
@@ -2987,26 +3041,13 @@ std::vector<BSONObj> IndexBuildsCoordinator::normalizeIndexSpecs(
     // for clients to validate (via the listIndexes output) whether a given partialFilterExpression
     // is equivalent to the filter that they originally submitted. Omitting this normalization does
     // not impact our internal index comparison semantics, since we compare based on the parsed
-    // MatchExpression trees rather than the serialized BSON specs. See SERVER-54357.
+    // MatchExpression trees rather than the serialized BSON specs.
+    //
+    // For similar reasons we do not normalize index projection objects here, if any, so their
+    // original forms get persisted in the catalog. Projection normalization to detect whether a
+    // candidate new index would duplicate an existing index is done only in the memory-only
+    // 'IndexDescriptor._normalizedProjection' field.
 
-    // If any of the specs describe wildcard indexes, normalize the wildcard projections if present.
-    // This will change all specs of the form {"a.b.c": 1} to normalized form {a: {b: {c : 1}}}.
-    std::transform(normalSpecs.begin(), normalSpecs.end(), normalSpecs.begin(), [](auto& spec) {
-        const auto kProjectionName = IndexDescriptor::kPathProjectionFieldName;
-        const auto pathProjectionSpec = spec.getObjectField(kProjectionName);
-        static const auto kWildcardKeyPattern = BSON("$**" << 1);
-        // It's illegal for the user to explicitly specify an empty wildcardProjection for creating
-        // a {"$**":1} index, and specify any wildcardProjection for a {"field.$**": 1} index. If
-        // the projection is empty, then it means that there is no projection to normalize.
-        if (pathProjectionSpec.isEmpty()) {
-            return spec;
-        }
-        auto wildcardProjection =
-            WildcardKeyGenerator::createProjectionExecutor(kWildcardKeyPattern, pathProjectionSpec);
-        auto normalizedProjection =
-            wildcardProjection.exec()->serializeTransformation(boost::none).toBson();
-        return spec.addField(BSON(kProjectionName << normalizedProjection).firstElement());
-    });
     return normalSpecs;
 }
 

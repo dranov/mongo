@@ -4,7 +4,7 @@
  *
  * @tags: [
  *   does_not_support_stepdowns,
- *   requires_fcv_52,
+ *   requires_fcv_60,
  * ]
  */
 (function() {
@@ -15,7 +15,7 @@ load('jstests/libs/parallel_shell_helpers.js');
 load("jstests/sharding/libs/find_chunks_util.js");
 load("jstests/sharding/libs/shard_versioning_util.js");
 
-const st = new ShardingTest({shards: 2});
+const st = new ShardingTest({shards: 2, other: {chunkSize: 1, enableAutoSplit: false}});
 const configDB = st.s.getDB("config");
 const dbName = 'AllowMigrations';
 
@@ -65,12 +65,14 @@ const testBalancer = function(setAllowMigrations, collBSetNoBalanceParam) {
     assert.commandWorked(st.s.adminCommand({shardCollection: collA.getFullName(), key: {_id: 1}}));
     assert.commandWorked(st.s.adminCommand({shardCollection: collB.getFullName(), key: {_id: 1}}));
 
+    const bigString = 'X'.repeat(1024 * 1024);  // 1MB
+
     // Split both collections into 4 chunks so balancing can occur.
     for (let coll of [collA, collB]) {
-        coll.insert({_id: 1});
-        coll.insert({_id: 10});
-        coll.insert({_id: 20});
-        coll.insert({_id: 30});
+        coll.insert({_id: 1, s: bigString});
+        coll.insert({_id: 10, s: bigString});
+        coll.insert({_id: 20, s: bigString});
+        coll.insert({_id: 30, s: bigString});
 
         assert.commandWorked(st.splitAt(coll.getFullName(), {_id: 10}));
         assert.commandWorked(st.splitAt(coll.getFullName(), {_id: 20}));
@@ -96,20 +98,9 @@ const testBalancer = function(setAllowMigrations, collBSetNoBalanceParam) {
     setAllowMigrationsCmd(collB.getFullName(), setAllowMigrations);
 
     st.startBalancer();
-    assert.soon(() => {
-        st.awaitBalancerRound();
-        const shard0Chunks =
-            findChunksUtil
-                .findChunksByNs(configDB, collA.getFullName(), {shard: st.shard0.shardName})
-                .itcount();
-        const shard1Chunks =
-            findChunksUtil
-                .findChunksByNs(configDB, collA.getFullName(), {shard: st.shard1.shardName})
-                .itcount();
-        jsTestLog(`shard0 chunks ${shard0Chunks}, shard1 chunks ${shard1Chunks}`);
-        return shard0Chunks == 2 && shard1Chunks == 2;
-    }, `Balancer failed to balance ${collA.getFullName()}`, 1000 * 60 * 10);
+    st.awaitBalance(collAName, dbName);
     st.stopBalancer();
+    st.verifyCollectionIsBalanced(collA);
 
     const collABalanceStatus =
         assert.commandWorked(st.s.adminCommand({balancerCollectionStatus: collA.getFullName()}));

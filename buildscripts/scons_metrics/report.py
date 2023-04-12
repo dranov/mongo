@@ -31,10 +31,6 @@ def main(scons_stdout_log_file: str, scons_cache_debug_log_file: str,
         print(f"Could not find SCons stdout log file '{scons_stdout_log_file}'.")
         sys.exit(1)
 
-    if not os.path.exists(scons_cache_debug_log_file):
-        print(f"Could not find SCons cache debug log file '{scons_cache_debug_log_file}'.")
-        sys.exit(1)
-
     scons_metrics = SconsMetrics(scons_stdout_log_file, scons_cache_debug_log_file)
     if not scons_metrics.raw_report:
         print(

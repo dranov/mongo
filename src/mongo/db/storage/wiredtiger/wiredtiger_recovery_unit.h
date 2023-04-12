@@ -45,8 +45,8 @@
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_stats.h"
 #include "mongo/util/timer.h"
-
 namespace mongo {
 
 using RoundUpPreparedTimestamps = WiredTigerBeginTxnBlock::RoundUpPreparedTimestamps;
@@ -55,41 +55,6 @@ using RoundUpReadTimestamp = WiredTigerBeginTxnBlock::RoundUpReadTimestamp;
 extern AtomicWord<std::int64_t> snapshotTooOldErrorCount;
 
 class BSONObjBuilder;
-
-class WiredTigerOperationStats final : public StorageStats {
-public:
-    /**
-     *  There are two types of statistics provided by WiredTiger engine - data and wait.
-     */
-    enum class Section { DATA, WAIT };
-
-    BSONObj toBSON() final;
-
-    StorageStats& operator+=(const StorageStats&) final;
-
-    WiredTigerOperationStats& operator+=(const WiredTigerOperationStats&);
-
-    /**
-     * Fetches an operation's storage statistics from WiredTiger engine.
-     */
-    void fetchStats(WT_SESSION*, const std::string&, const std::string&);
-
-    std::shared_ptr<StorageStats> getCopy() final;
-
-private:
-    /**
-     * Each statistic in WiredTiger has an integer key, which this map associates with a section
-     * (either DATA or WAIT) and user-readable name.
-     */
-    static std::map<int, std::pair<StringData, Section>> _statNameMap;
-
-    /**
-     * Stores the value for each statistic returned by a WiredTiger cursor. Each statistic is
-     * associated with an integer key, which can be mapped to a name and section using the
-     * '_statNameMap'.
-     */
-    std::map<int, long long> _stats;
-};
 
 class WiredTigerRecoveryUnit final : public RecoveryUnit {
 public:
@@ -174,7 +139,7 @@ public:
         return _readOnce;
     };
 
-    std::shared_ptr<StorageStats> getOperationStatistics() const override;
+    std::unique_ptr<StorageStats> computeOperationStatisticsSinceLastCall() override;
 
     void refreshSnapshot() override;
 
@@ -257,10 +222,11 @@ private:
     Timestamp _beginTransactionAtNoOverlapTimestamp(WT_SESSION* session);
 
     /**
-     * Starts a transaction at the lastApplied timestamp. Returns the timestamp at which the
-     * transaction was started.
+     * Starts a transaction at the lastApplied timestamp stored in '_readAtTimestamp'. Sets
+     * '_readAtTimestamp' to the actual timestamp used by the storage engine in case rounding
+     * occured.
      */
-    Timestamp _beginTransactionAtLastAppliedTimestamp(WT_SESSION* session);
+    void _beginTransactionAtLastAppliedTimestamp(WT_SESSION* session);
 
     /**
      * Returns the timestamp at which the current transaction is reading.
@@ -315,6 +281,8 @@ private:
     boost::optional<int64_t> _oplogVisibleTs = boost::none;
     bool _gatherWriteContextForDebugging = false;
     std::vector<BSONObj> _writeContextForDebugging;
+
+    WiredTigerStats _sessionStatsAfterLastOperation;
 };
 
 }  // namespace mongo

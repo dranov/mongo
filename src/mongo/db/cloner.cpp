@@ -48,7 +48,7 @@
 #include "mongo/db/cloner_gen.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/list_collections_filter.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -533,6 +533,13 @@ Status Cloner::copyDb(OperationContext* opCtx,
 
         // now build the secondary indexes
         for (auto&& params : createCollectionParams) {
+
+            // Indexes of sharded collections are not copied: the primary shard is not required to
+            // have all indexes. The listIndexes cmd is sent to the shard owning the MinKey value.
+            if (params.shardedColl) {
+                continue;
+            }
+
             LOGV2(20422,
                   "copying indexes for: {collectionInfo}",
                   "Copying indexes",

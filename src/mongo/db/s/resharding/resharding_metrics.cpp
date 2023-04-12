@@ -406,6 +406,60 @@ void ReshardingMetrics::onStepUp(Role role) noexcept {
     // instead of starting from the current time.
 }
 
+void ReshardingMetrics::onStepUp(RecipientStateEnum state,
+                                 const ReshardingRecipientCountsAndMetrics& recipientMetrics) {
+    stdx::lock_guard<Latch> lk(_mutex);
+
+    _emplaceCurrentOpForRole(Role::kRecipient, boost::none);
+    _onStepUpCalled = true;
+
+    invariant(_currentOp, kNoOperationInProgress);
+    invariant(_currentOp->documentsCopied == 0, kMetricsSetBeforeRestore);
+    invariant(_currentOp->bytesCopied == 0, kMetricsSetBeforeRestore);
+    invariant(_currentOp->oplogEntriesFetched == 0, kMetricsSetBeforeRestore);
+    invariant(_currentOp->oplogEntriesApplied == 0, kMetricsSetBeforeRestore);
+
+    _currentOp->recipientState = state;
+    _currentOp->documentsCopied = recipientMetrics.documentCountCopied;
+    _currentOp->bytesCopied = recipientMetrics.documentBytesCopied;
+    _currentOp->oplogEntriesFetched = recipientMetrics.oplogEntriesFetched;
+    _currentOp->oplogEntriesApplied = recipientMetrics.oplogEntriesApplied;
+
+    if (recipientMetrics.approxBytesToCopy)
+        _currentOp->bytesToCopy = recipientMetrics.approxBytesToCopy.get();
+
+
+    const auto& timeIntervals = recipientMetrics.metrics;
+
+    // Restore in memory state of document copy metrics.
+    // Not calling startCopyingDocuments or endCopyingDocuments because they acquire a mutex that we
+    // already have.
+    //
+    // Also, note that it is possible for documentCopyInterval->getStart() to be none and for
+    // documentCopyInterval->getStop() to be not none.  That can happen if the cluster is upgraded
+    // to include code for persisting time intervals during a resharding operation.
+    // In that case, restore neither the start nor stop time. The resharding coordinator will still
+    // treat this scenario as the recipient shard being completely caught up after a primary
+    // failover and engage the critical section too early.
+    const auto& documentCopyInterval = timeIntervals.getDocumentCopy();
+    if (documentCopyInterval && documentCopyInterval->getStart()) {
+        _currentOp->copyingDocuments.start(documentCopyInterval->getStart().get());
+        if (documentCopyInterval->getStop()) {
+            _currentOp->copyingDocuments.end(documentCopyInterval->getStop().get());
+        }
+    }
+    // Restore in memory state of oplog application metrics.
+    // Not calling startApplyingOplogEntries or endApplyingOplogEntries because they acquire a mutex
+    // that we already have.
+    const auto& oplogApplicationInterval = timeIntervals.getOplogApplication();
+    if (oplogApplicationInterval && oplogApplicationInterval->getStart()) {
+        _currentOp->applyingOplogEntries.start(oplogApplicationInterval->getStart().get());
+        if (oplogApplicationInterval->getStop()) {
+            _currentOp->applyingOplogEntries.end(oplogApplicationInterval->getStop().get());
+        }
+    }
+}
+
 void ReshardingMetrics::onStepUp(DonorStateEnum state, ReshardingDonorMetrics donorMetrics) {
     stdx::lock_guard<Latch> lk(_mutex);
     auto operationRuntime = donorMetrics.getOperationRuntime();
@@ -484,6 +538,9 @@ void ReshardingMetrics::setDonorState(DonorStateEnum state) noexcept {
 
 void ReshardingMetrics::setRecipientState(RecipientStateEnum state) noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
+    if (!_currentOp && state == RecipientStateEnum::kDone) {
+        return;
+    }
     invariant(_currentOp, kNoOperationInProgress);
 
     const auto oldState = std::exchange(_currentOp->recipientState, state);
@@ -634,6 +691,10 @@ void ReshardingMetrics::enterCriticalSection(Date_t start) {
 
 void ReshardingMetrics::leaveCriticalSection(Date_t end) {
     stdx::lock_guard<Latch> lk(_mutex);
+    if (!_currentOp) {
+        return;
+    }
+
     _currentOp->inCriticalSection.forceEnd(end);
 }
 
@@ -660,22 +721,6 @@ void ReshardingMetrics::onOplogEntriesApplied(int64_t entries) noexcept {
 
     _currentOp->oplogEntriesApplied += entries;
     _cumulativeOp->oplogEntriesApplied += entries;
-}
-
-void ReshardingMetrics::restoreForCurrentOp(int64_t documentCountCopied,
-                                            int64_t documentBytesCopied,
-                                            int64_t oplogEntriesFetched,
-                                            int64_t oplogEntriesApplied) noexcept {
-    invariant(_currentOp, kNoOperationInProgress);
-    invariant(_currentOp->documentsCopied == 0, kMetricsSetBeforeRestore);
-    invariant(_currentOp->bytesCopied == 0, kMetricsSetBeforeRestore);
-    invariant(_currentOp->oplogEntriesFetched == 0, kMetricsSetBeforeRestore);
-    invariant(_currentOp->oplogEntriesApplied == 0, kMetricsSetBeforeRestore);
-
-    _currentOp->documentsCopied = documentCountCopied;
-    _currentOp->bytesCopied = documentBytesCopied;
-    _currentOp->oplogEntriesFetched = oplogEntriesFetched;
-    _currentOp->oplogEntriesApplied = oplogEntriesApplied;
 }
 
 void ReshardingMetrics::onWriteDuringCriticalSection(int64_t writes) noexcept {

@@ -119,7 +119,7 @@ class EnterpriseDistro(packager.Distro):
     def build_os(self, arch):  # pylint: disable=too-many-branches
         """Return the build os label in the binary package to download.
 
-        The labels "rhel57", "rhel62", "rhel67", "rhel70", "rhel80" are for redhat,
+        The labels "rhel57", "rhel62", "rhel67", "rhel70", "rhel80", "rhel90" are for redhat,
         the others are delegated to the super class.
         """
         # pylint: disable=too-many-return-statements
@@ -139,16 +139,16 @@ class EnterpriseDistro(packager.Distro):
             return []
         if arch == "arm64":
             if self.dname == 'ubuntu':
-                return ["ubuntu1804", "ubuntu2004"]
+                return ["ubuntu1804", "ubuntu2004", "ubuntu2204"]
         if arch == "aarch64":
             if self.dname == 'redhat':
-                return ["rhel82"]
+                return ["rhel82", "rhel90"]
             if self.dname == 'amazon2':
                 return ["amazon2"]
             return []
 
         if re.search("(redhat|fedora|centos)", self.dname):
-            return ["rhel80", "rhel70", "rhel62", "rhel57"]
+            return ["rhel90", "rhel80", "rhel70", "rhel62", "rhel57"]
         return super(EnterpriseDistro, self).build_os(arch)
         # pylint: enable=too-many-return-statements
 

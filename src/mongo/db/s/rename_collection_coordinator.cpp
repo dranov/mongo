@@ -40,6 +40,7 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/recoverable_critical_section_service.h"
 #include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_state.h"
@@ -167,13 +168,16 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
     return ExecutorFuture<void>(**executor)
         .then(_executePhase(
             Phase::kCheckPreconditions,
-            [this, anchor = shared_from_this()] {
+            [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
 
                 const auto& fromNss = nss();
                 const auto& toNss = _request.getTo();
+
+                const auto criticalSectionReason =
+                    sharding_ddl_util::getCriticalSectionReasonForRename(fromNss, toNss);
 
                 try {
                     uassert(ErrorCodes::InvalidOptions,
@@ -190,7 +194,8 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
 
                         uassert(ErrorCodes::IllegalOperation,
                                 "Cannot rename an encrypted collection",
-                                !coll || !coll->getCollectionOptions().encryptedFieldConfig);
+                                !coll || !coll->getCollectionOptions().encryptedFieldConfig ||
+                                    _doc.getAllowEncryptedCollectionRename().value_or(false));
                     }
 
                     // Make sure the source collection exists
@@ -209,21 +214,53 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                         sharding_ddl_util::checkDbPrimariesOnTheSameShard(opCtx, fromNss, toNss);
                     }
 
-                    // Make sure the target namespace is not a view
-                    {
+                    const auto optTargetCollType = getShardedCollection(opCtx, toNss);
+                    const bool targetIsSharded = (bool)optTargetCollType;
+                    _doc.setTargetIsSharded(targetIsSharded);
+                    _doc.setTargetUUID(getCollectionUUID(
+                        opCtx, toNss, optTargetCollType, /*throwNotFound*/ false));
+
+                    if (!targetIsSharded) {
+                        // (SERVER-67325) Acquire critical section on the target collection in order
+                        // to disallow concurrent `createCollection`. In case the collection does
+                        // not exist, it will be later released by the rename participant. In case
+                        // the collection exists and is unsharded, the critical section can be
+                        // released right away as the participant will re-acquire it when needed.
+                        auto criticalSection = RecoverableCriticalSectionService::get(opCtx);
+                        criticalSection->acquireRecoverableCriticalSectionBlockWrites(
+                            opCtx,
+                            toNss,
+                            criticalSectionReason,
+                            ShardingCatalogClient::kLocalWriteConcern);
+                        criticalSection->promoteRecoverableCriticalSectionToBlockAlsoReads(
+                            opCtx,
+                            toNss,
+                            criticalSectionReason,
+                            ShardingCatalogClient::kLocalWriteConcern);
+
+                        // Make sure the target namespace is not a view
                         uassert(ErrorCodes::CommandNotSupportedOnView,
                                 str::stream() << "Can't rename to target collection `" << toNss
                                               << "` because it is a view.",
                                 !CollectionCatalog::get(opCtx)->lookupView(opCtx, toNss));
-                    }
 
-                    const auto optTargetCollType = getShardedCollection(opCtx, toNss);
-                    _doc.setTargetIsSharded((bool)optTargetCollType);
-                    _doc.setTargetUUID(getCollectionUUID(
-                        opCtx, toNss, optTargetCollType, /*throwNotFound*/ false));
+                        if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx,
+                                                                                       toNss)) {
+                            // Release the critical section because the unsharded target collection
+                            // already exists, hence no risk of concurrent `createCollection`
+                            criticalSection->releaseRecoverableCriticalSection(
+                                opCtx,
+                                toNss,
+                                criticalSectionReason,
+                                WriteConcerns::kLocalWriteConcern);
+                        }
+                    }
 
                     sharding_ddl_util::checkRenamePreconditions(
                         opCtx, sourceIsSharded, toNss, _doc.getDropTarget());
+
+                    sharding_ddl_util::checkCatalogConsistencyAcrossShardsForRename(
+                        opCtx, fromNss, toNss, _doc.getDropTarget(), executor);
 
                     {
                         AutoGetCollection coll{opCtx, toNss, MODE_IS};
@@ -231,10 +268,18 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                             opCtx, toNss, *coll, _doc.getExpectedTargetUUID());
                         uassert(ErrorCodes::IllegalOperation,
                                 "Cannot rename to an existing encrypted collection",
-                                !coll || !coll->getCollectionOptions().encryptedFieldConfig);
+                                !coll || !coll->getCollectionOptions().encryptedFieldConfig ||
+                                    _doc.getAllowEncryptedCollectionRename().value_or(false));
                     }
 
                 } catch (const DBException&) {
+                    auto criticalSection = RecoverableCriticalSectionService::get(opCtx);
+                    criticalSection->releaseRecoverableCriticalSection(
+                        opCtx,
+                        toNss,
+                        criticalSectionReason,
+                        WriteConcerns::kLocalWriteConcern,
+                        false /* throwIfReasonDiffers */);
                     _completeOnError = true;
                     throw;
                 }

@@ -31,6 +31,10 @@ class Stat:
     def __cmp__(self, other):
         return cmp(self.desc.lower(), other.desc.lower())
 
+class AutoCommitStat(Stat):
+    prefix = 'autocommit'
+    def __init__(self, name, desc, flags=''):
+        Stat.__init__(self, name, AutoCommitStat.prefix, desc, flags)
 class BlockCacheStat(Stat):
     prefix = 'block-cache'
     def __init__(self, name, desc, flags=''):
@@ -260,7 +264,8 @@ conn_stats = [
     CacheStat('cache_eviction_internal_pages_seen', 'internal pages seen by eviction walk'),
     CacheStat('cache_eviction_internal_pages_already_queued', 'internal pages seen by eviction walk that are already queued'),
     CacheStat('cache_eviction_internal_pages_queued', 'internal pages queued for eviction'),
-    CacheStat('cache_eviction_maximum_page_size', 'maximum page size at eviction', 'no_clear,no_scale,size'),
+    CacheStat('cache_eviction_maximum_page_size', 'maximum page size seen at eviction', 'no_clear,no_scale,size'),
+    CacheStat('cache_eviction_maximum_seconds', 'maximum seconds spent at a single eviction', 'no_clear,no_scale,size'),
     CacheStat('cache_eviction_pages_queued', 'pages queued for eviction'),
     CacheStat('cache_eviction_pages_queued_oldest', 'pages queued for urgent eviction during walk'),
     CacheStat('cache_eviction_pages_queued_post_lru', 'pages queued for eviction post lru sorting'),
@@ -493,6 +498,8 @@ conn_stats = [
     ##########################################
     # Reconciliation statistics
     ##########################################
+    RecStat('rec_maximum_hs_wrapup_seconds', 'maximum seconds spent in moving updates to the history store in a reconciliation', 'no_clear,no_scale,size'),
+    RecStat('rec_maximum_image_build_seconds', 'maximum seconds spent in building a disk image in a reconciliation', 'no_clear,no_scale,size'),
     RecStat('rec_maximum_seconds', 'maximum seconds spent in a reconciliation call', 'no_clear,no_scale,size'),
     RecStat('rec_overflow_key_leaf', 'leaf-page overflow keys'),
     RecStat('rec_pages_with_prepare', 'page reconciliation calls that resulted in values with prepared transaction metadata'),
@@ -590,8 +597,6 @@ conn_stats = [
     TxnStat('txn_prepare_active', 'prepared transactions currently active'),
     TxnStat('txn_prepare_commit', 'prepared transactions committed'),
     TxnStat('txn_prepare_rollback', 'prepared transactions rolled back'),
-    TxnStat('txn_prepare_rollback_do_not_remove_hs_update', 'prepared transactions rolled back and do not remove the history store entry'),
-    TxnStat('txn_prepare_rollback_fix_hs_update_with_ckpt_reserved_txnid', 'prepared transactions rolled back and fix the history store entry with checkpoint reserved transaction id'),
     TxnStat('txn_prepared_updates_committed', 'Number of prepared updates committed'),
     TxnStat('txn_prepared_updates', 'Number of prepared updates'),
     TxnStat('txn_prepared_updates_key_repeated', 'Number of prepared updates repeated on the same key'),
@@ -798,6 +803,12 @@ dsrc_stats = sorted(dsrc_stats, key=attrgetter('desc'))
 ##########################################
 conn_dsrc_stats = [
     ##########################################
+    # Autocommit statistics
+    ##########################################
+    AutoCommitStat('autocommit_readonly_retry', 'retries for readonly operations'),
+    AutoCommitStat('autocommit_update_retry', 'retries for update operations'),
+
+    ##########################################
     # Cache and eviction statistics
     ##########################################
     CacheStat('cache_bytes_dirty', 'tracked dirty bytes in the cache', 'no_clear,no_scale,size'),
@@ -811,6 +822,7 @@ conn_dsrc_stats = [
     CacheStat('cache_eviction_blocked_ooo_checkpoint_race_2', 'eviction gave up due to detecting an out of order tombstone ahead of the selected on disk update'),
     CacheStat('cache_eviction_blocked_ooo_checkpoint_race_3', 'eviction gave up due to detecting an out of order tombstone ahead of the selected on disk update after validating the update chain'),
     CacheStat('cache_eviction_blocked_ooo_checkpoint_race_4', 'eviction gave up due to detecting out of order timestamps on the update chain after the selected on disk update'),
+    CacheStat('cache_eviction_blocked_remove_hs_race_with_checkpoint', 'eviction gave up due to needing to remove a record from the history store but checkpoint is running'),
     CacheStat('cache_eviction_clean', 'unmodified pages evicted'),
     CacheStat('cache_eviction_deepen', 'page split during eviction deepened the tree'),
     CacheStat('cache_eviction_dirty', 'modified pages evicted'),
@@ -963,6 +975,7 @@ session_stats = [
     SessionStat('cache_time', 'time waiting for cache (usecs)'),
     SessionStat('lock_dhandle_wait', 'dhandle lock wait time (usecs)'),
     SessionStat('lock_schema_wait', 'schema lock wait time (usecs)'),
+    SessionStat('txn_bytes_dirty', 'dirty bytes in this txn'),
     SessionStat('read_time', 'page read from disk to cache time (usecs)'),
     SessionStat('write_time', 'page write from cache to disk time (usecs)'),
 ]

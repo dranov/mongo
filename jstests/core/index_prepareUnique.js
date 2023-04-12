@@ -1,21 +1,17 @@
 /**
- * Tests that the createIndex command accepts a prepareUnique field and works accordingly
- * then.
+ * Tests that the createIndex command accepts a prepareUnique field and works accordingly.
  *
- * @tags: [requires_fcv_53]
+ * @tags: [assumes_no_implicit_collection_creation_after_drop]
  */
 (function() {
 "use strict";
 
+load("jstests/libs/feature_flag_util.js");
+
 const coll = db.index_prepareUnique;
 coll.drop();
 
-const collModIndexUniqueEnabled = assert
-                                      .commandWorked(db.getMongo().adminCommand(
-                                          {getParameter: 1, featureFlagCollModIndexUnique: 1}))
-                                      .featureFlagCollModIndexUnique.value;
-
-if (!collModIndexUniqueEnabled) {
+if (!FeatureFlagUtil.isEnabled(db, "CollModIndexUnique")) {
     jsTestLog('Skipping test because the collMod unique index feature flag is disabled.');
     return;
 }

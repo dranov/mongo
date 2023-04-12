@@ -39,7 +39,7 @@
 #include "mongo/db/catalog/collection_uuid_mismatch.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -344,7 +344,7 @@ void dropReadyIndexes(OperationContext* opCtx,
             uassert(
                 ErrorCodes::CannotDropShardKeyIndex,
                 "Cannot drop the only compatible index for this collection's shard key",
-                !isLastShardKeyIndex(
+                !isLastNonHiddenShardKeyIndex(
                     opCtx, collection, indexCatalog, indexName, collDescription.getKeyPattern()));
         }
 
@@ -515,11 +515,11 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
                 if (collDescription.isSharded()) {
                     uassert(ErrorCodes::CannotDropShardKeyIndex,
                             "Cannot drop the only compatible index for this collection's shard key",
-                            !isLastShardKeyIndex(opCtx,
-                                                 collection->getCollection(),
-                                                 indexCatalog,
-                                                 indexName,
-                                                 collDescription.getKeyPattern()));
+                            !isLastNonHiddenShardKeyIndex(opCtx,
+                                                          collection->getCollection(),
+                                                          indexCatalog,
+                                                          indexName,
+                                                          collDescription.getKeyPattern()));
                 }
 
                 auto desc = indexCatalog->findIndexByName(opCtx, indexName, includeUnfinished);

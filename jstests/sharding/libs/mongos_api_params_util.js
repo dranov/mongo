@@ -75,7 +75,7 @@ let MongosAPIParametersUtil = (function() {
 
     function awaitRemoveShard(shardName) {
         assert.commandWorked(st.startBalancer());
-        st.waitForBalancer(true, 60000);
+        st.awaitBalancerRound();
         assert.soon(() => {
             const res = st.s.adminCommand({removeShard: shardName});
             jsTestLog(`removeShard result: ${tojson(res)}`);
@@ -1218,6 +1218,10 @@ let MongosAPIParametersUtil = (function() {
             commandName: "setFreeMonitoring",
             skip: "explicitly fails for mongos, primary mongod only",
             conditional: true
+        },
+        {
+            commandName: "setProfilingFilterGlobally",
+            skip: "executes locally on mongos (not sent to any remote node)",
         },
         {
             commandName: "setParameter",

@@ -337,20 +337,21 @@ public:
 
 extern DotsAndDollarsFieldsCounters dotsAndDollarsFieldsCounters;
 
-class QueryEngineCounters {
+class QueryFrameworkCounters {
 public:
-    QueryEngineCounters()
-        : sbeFindQueryMetric("query.queryExecutionEngine.find.sbe", &sbeFindQueryCounter),
-          classicFindQueryMetric("query.queryExecutionEngine.find.classic",
-                                 &classicFindQueryCounter),
-          sbeOnlyAggregationMetric("query.queryExecutionEngine.aggregate.sbeOnly",
+    QueryFrameworkCounters()
+        : sbeFindQueryMetric("query.queryFramework.find.sbe", &sbeFindQueryCounter),
+          classicFindQueryMetric("query.queryFramework.find.classic", &classicFindQueryCounter),
+          cqfFindQueryMetric("query.queryFramework.find.cqf", &cqfFindQueryCounter),
+          sbeOnlyAggregationMetric("query.queryFramework.aggregate.sbeOnly",
                                    &sbeOnlyAggregationCounter),
-          classicOnlyAggregationMetric("query.queryExecutionEngine.aggregate.classicOnly",
+          classicOnlyAggregationMetric("query.queryFramework.aggregate.classicOnly",
                                        &classicOnlyAggregationCounter),
-          sbeHybridAggregationMetric("query.queryExecutionEngine.aggregate.sbeHybrid",
+          sbeHybridAggregationMetric("query.queryFramework.aggregate.sbeHybrid",
                                      &sbeHybridAggregationCounter),
-          classicHybridAggregationMetric("query.queryExecutionEngine.aggregate.classicHybrid",
-                                         &classicHybridAggregationCounter) {}
+          classicHybridAggregationMetric("query.queryFramework.aggregate.classicHybrid",
+                                         &classicHybridAggregationCounter),
+          cqfAggregationMetric("query.queryFramework.aggregate.cqf", &cqfAggregationQueryCounter) {}
 
     void incrementQueryEngineCounters(CurOp* curop) {
         auto& debug = curop->debug();
@@ -376,91 +377,131 @@ public:
                     sbeOnlyAggregationCounter.increment();
                 }
             }
+        } else if (debug.cqfUsed) {
+            if (cmdName == "find") {
+                cqfFindQueryCounter.increment();
+            } else {
+                cqfAggregationQueryCounter.increment();
+            }
         }
     }
 
-    // Query counters that record whether a find query was fully or partially executed in SBE, or
-    // fully executed using the classic engine. One or the other will always be incremented during a
-    // query.
+    // Query counters that record whether a find query was fully or partially executed in SBE, fully
+    // executed using the classic engine, or fully executed using the common query framework (CQF).
+    // One of these will always be incremented during a query.
     Counter64 sbeFindQueryCounter;
     Counter64 classicFindQueryCounter;
+    Counter64 cqfFindQueryCounter;
     ServerStatusMetricField<Counter64> sbeFindQueryMetric;
     ServerStatusMetricField<Counter64> classicFindQueryMetric;
+    ServerStatusMetricField<Counter64> cqfFindQueryMetric;
     // Aggregation query counters that record whether an aggregation was fully or partially executed
-    // in DocumentSource (an sbe/classic hybrid plan), or fully pushed down to the sbe/classic
-    // layer. Only incremented during aggregations.
+    // in DocumentSource (an sbe/classic hybrid plan), fully pushed down to the sbe/classic layer,
+    // or executed using CQF. These are only incremented during aggregations.
     Counter64 sbeOnlyAggregationCounter;
     Counter64 classicOnlyAggregationCounter;
     Counter64 sbeHybridAggregationCounter;
     Counter64 classicHybridAggregationCounter;
+    Counter64 cqfAggregationQueryCounter;
     ServerStatusMetricField<Counter64> sbeOnlyAggregationMetric;
     ServerStatusMetricField<Counter64> classicOnlyAggregationMetric;
     ServerStatusMetricField<Counter64> sbeHybridAggregationMetric;
     ServerStatusMetricField<Counter64> classicHybridAggregationMetric;
+    ServerStatusMetricField<Counter64> cqfAggregationMetric;
 };
-extern QueryEngineCounters queryEngineCounters;
-
-class OperatorCountersAggExpressions {
-private:
-    struct AggExprCounter {
-        AggExprCounter(StringData name)
-            : metric("operatorCounters.expressions." + name, &counter) {}
-
-        Counter64 counter;
-        ServerStatusMetricField<Counter64> metric;
-    };
-
-public:
-    void addAggExpressionCounter(StringData name) {
-        operatorCountersAggExpressionMap[name] = std::make_unique<AggExprCounter>(name);
-    }
-
-    void mergeCounters(StringMap<uint64_t>& toMerge) {
-        for (auto&& [name, cnt] : toMerge) {
-            if (auto it = operatorCountersAggExpressionMap.find(name);
-                it != operatorCountersAggExpressionMap.end()) {
-                it->second->counter.increment(cnt);
-            }
-        }
-    }
-
-private:
-    // Map of aggregation expressions to the number of occurrences in aggregation pipelines.
-    StringMap<std::unique_ptr<AggExprCounter>> operatorCountersAggExpressionMap = {};
-};
-
-extern OperatorCountersAggExpressions operatorCountersAggExpressions;
+extern QueryFrameworkCounters queryFrameworkCounters;
 
 /**
- * Global counters for match expressions.
+ * Generic class for counters of expressions inside various MQL statements.
  */
-class OperatorCountersMatchExpressions {
+class OperatorCounters {
 private:
-    struct MatchExprCounter {
-        MatchExprCounter(StringData name) : metric("operatorCounters.match." + name, &counter) {}
-
+    struct ExprCounter {
+        ExprCounter(const std::string name) : metric(name, &counter) {}
         Counter64 counter;
         ServerStatusMetricField<Counter64> metric;
     };
 
 public:
-    void addMatchExprCounter(StringData name) {
-        operatorCountersMatchExprMap[name] = std::make_unique<MatchExprCounter>(name);
+    OperatorCounters(const std::string prefix) : _prefix{prefix} {}
+
+    void addCounter(const std::string name) {
+        const StringData sdName(name);
+        operatorCountersExprMap[sdName] = std::make_unique<ExprCounter>(_prefix + name);
     }
 
     void mergeCounters(StringMap<uint64_t>& toMerge) {
         for (auto&& [name, cnt] : toMerge) {
-            if (auto it = operatorCountersMatchExprMap.find(name);
-                it != operatorCountersMatchExprMap.end()) {
+            if (auto it = operatorCountersExprMap.find(name); it != operatorCountersExprMap.end()) {
                 it->second->counter.increment(cnt);
             }
         }
     }
 
 private:
-    // Map of match expressions to the number of occurrences in queries.
-    StringMap<std::unique_ptr<MatchExprCounter>> operatorCountersMatchExprMap = {};
+    const std::string _prefix;
+    // Map of expressions to the number of occurrences in queries.
+    StringMap<std::unique_ptr<ExprCounter>> operatorCountersExprMap = {};
 };
 
-extern OperatorCountersMatchExpressions operatorCountersMatchExpressions;
+class ValidatorCounters {
+public:
+    ValidatorCounters() {
+        _validatorCounterMap["create"] = std::make_unique<ValidatorCounter>("create");
+        _validatorCounterMap["collMod"] = std::make_unique<ValidatorCounter>("collMod");
+    }
+
+    void incrementCounters(const StringData cmdName,
+                           const BSONObj& validator,
+                           bool parsingSucceeded) {
+        if (!validator.isEmpty()) {
+            auto validatorCounter = _validatorCounterMap.find(cmdName);
+            tassert(7139200,
+                    str::stream() << "The validator counters are not support for the command: "
+                                  << cmdName,
+                    validatorCounter != _validatorCounterMap.end());
+            validatorCounter->second->total.increment();
+
+            if (!parsingSucceeded) {
+                validatorCounter->second->failed.increment();
+            }
+            if (validator.hasField("$jsonSchema")) {
+                validatorCounter->second->jsonSchema.increment();
+            }
+        }
+    }
+
+private:
+    struct ValidatorCounter {
+        ValidatorCounter(const StringData name)
+            : totalMetric("commands." + name + ".validator.total", &total),
+              failedMetric("commands." + name + ".validator.failed", &failed),
+              jsonSchemaMetric("commands." + name + ".validator.jsonSchema", &jsonSchema) {}
+        Counter64 total;
+        Counter64 failed;
+        Counter64 jsonSchema;
+        ServerStatusMetricField<Counter64> totalMetric;
+        ServerStatusMetricField<Counter64> failedMetric;
+        ServerStatusMetricField<Counter64> jsonSchemaMetric;
+    };
+
+    StringMap<std::unique_ptr<ValidatorCounter>> _validatorCounterMap = {};
+};
+
+extern ValidatorCounters validatorCounters;
+
+// Global counters for expressions inside aggregation pipelines.
+extern OperatorCounters operatorCountersAggExpressions;
+// Global counters for match expressions.
+extern OperatorCounters operatorCountersMatchExpressions;
+// Global counters for accumulator expressions apply to $group.
+extern OperatorCounters operatorCountersGroupAccumulatorExpressions;
+// Global counters for accumulator expressions apply to $setWindowFields.
+extern OperatorCounters operatorCountersWindowAccumulatorExpressions;
+
+// Track the number of {multi:true} updates.
+extern Counter64 updateManyCount;
+// Track the number of deleteMany calls.
+extern Counter64 deleteManyCount;
+
 }  // namespace mongo

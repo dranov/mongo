@@ -102,8 +102,9 @@ ScopedCollectionFilter CollectionShardingRuntime::getOwnershipFilter(
     if (!supportNonVersionedOperations) {
         optReceivedShardVersion = getOperationReceivedVersion(opCtx, _nss);
         // No operations should be calling getOwnershipFilter without a shard version
-        invariant(optReceivedShardVersion,
-                  "getOwnershipFilter called by operation that doesn't specify shard version");
+        tassert(7032300,
+                "getOwnershipFilter called by operation that doesn't specify shard version",
+                optReceivedShardVersion);
     }
 
     auto metadata =
@@ -112,10 +113,11 @@ ScopedCollectionFilter CollectionShardingRuntime::getOwnershipFilter(
                                        supportNonVersionedOperations);
 
     if (!supportNonVersionedOperations) {
-        invariant(!ChunkVersion::isIgnoredVersion(*optReceivedShardVersion) ||
-                      !metadata->get().allowMigrations() || !metadata->get().isSharded(),
-                  "For sharded collections getOwnershipFilter cannot be relied on without a valid "
-                  "shard version");
+        tassert(7032301,
+                "For sharded collections getOwnershipFilter cannot be relied on without a valid "
+                "shard version",
+                !ChunkVersion::isIgnoredVersion(*optReceivedShardVersion) ||
+                    !metadata->get().allowMigrations() || !metadata->get().isSharded());
     }
 
     return {std::move(metadata)};
@@ -163,6 +165,10 @@ void CollectionShardingRuntime::checkShardVersionOrThrow(OperationContext* opCtx
 void CollectionShardingRuntime::enterCriticalSectionCatchUpPhase(const CSRLock&,
                                                                  const BSONObj& reason) {
     _critSec.enterCriticalSectionCatchUpPhase(reason);
+
+    if (_shardVersionInRecoverOrRefresh) {
+        _shardVersionInRecoverOrRefresh->cancellationSource.cancel();
+    }
 }
 
 void CollectionShardingRuntime::enterCriticalSectionCommitPhase(const CSRLock&,
@@ -198,8 +204,9 @@ void CollectionShardingRuntime::setFilteringMetadata(OperationContext* opCtx,
 void CollectionShardingRuntime::setFilteringMetadata_withLock(OperationContext* opCtx,
                                                               CollectionMetadata newMetadata,
                                                               const CSRLock& csrExclusiveLock) {
-    invariant(!newMetadata.isSharded() || !_nss.isNamespaceAlwaysUnsharded(),
-              str::stream() << "Namespace " << _nss.ns() << " must never be sharded.");
+    tassert(7032302,
+            str::stream() << "Namespace " << _nss.ns() << " must never be sharded.",
+            !newMetadata.isSharded() || !_nss.isNamespaceAlwaysUnsharded());
 
     stdx::lock_guard lk(_metadataManagerLock);
 
@@ -211,9 +218,11 @@ void CollectionShardingRuntime::setFilteringMetadata_withLock(OperationContext* 
         _metadataType = MetadataType::kUnsharded;
         _metadataManager.reset();
         ++_numMetadataManagerChanges;
-    } else if (!_metadataManager ||
-               !newMetadata.uuidMatches(_metadataManager->getCollectionUuid())) {
-        _metadataType = MetadataType::kSharded;
+        return;
+    }
+
+    _metadataType = MetadataType::kSharded;
+    if (!_metadataManager || !newMetadata.uuidMatches(_metadataManager->getCollectionUuid())) {
         _metadataManager = std::make_shared<MetadataManager>(
             opCtx->getServiceContext(), _nss, _rangeDeleterExecutor, newMetadata);
         ++_numMetadataManagerChanges;
@@ -222,7 +231,8 @@ void CollectionShardingRuntime::setFilteringMetadata_withLock(OperationContext* 
     }
 }
 
-void CollectionShardingRuntime::clearFilteringMetadata(OperationContext* opCtx) {
+void CollectionShardingRuntime::_clearFilteringMetadata(OperationContext* opCtx,
+                                                        bool clearMetadataManager) {
     const auto csrLock = CSRLock::lockExclusive(opCtx, this);
     if (_shardVersionInRecoverOrRefresh) {
         _shardVersionInRecoverOrRefresh->cancellationSource.cancel();
@@ -234,10 +244,21 @@ void CollectionShardingRuntime::clearFilteringMetadata(OperationContext* opCtx) 
                     1,
                     "Clearing metadata for collection {namespace}",
                     "Clearing collection metadata",
-                    "namespace"_attr = _nss);
+                    "namespace"_attr = _nss,
+                    "clearMetadataManager"_attr = clearMetadataManager);
         _metadataType = MetadataType::kUnknown;
-        _metadataManager.reset();
+        if (clearMetadataManager)
+            _metadataManager.reset();
     }
+}
+
+void CollectionShardingRuntime::clearFilteringMetadata(OperationContext* opCtx) {
+    _clearFilteringMetadata(opCtx, /* clearMetadataManager */ false);
+}
+
+void CollectionShardingRuntime::clearFilteringMetadataForDroppedCollection(
+    OperationContext* opCtx) {
+    _clearFilteringMetadata(opCtx, /* clearMetadataManager */ true);
 }
 
 SharedSemiFuture<void> CollectionShardingRuntime::cleanUpRange(ChunkRange const& range,
@@ -263,7 +284,7 @@ Status CollectionShardingRuntime::waitForClean(OperationContext* opCtx,
 
             // If the metadata was reset, or the collection was dropped and recreated since the
             // metadata manager was created, return an error.
-            if (!self->_metadataManager ||
+            if (self->_metadataType != MetadataType::kSharded ||
                 (collectionUuid != self->_metadataManager->getCollectionUuid())) {
                 return {ErrorCodes::ConflictingOperationInProgress,
                         "Collection being migrated was dropped and created or otherwise had its "
@@ -421,7 +442,7 @@ void CollectionShardingRuntime::appendShardVersion(BSONObjBuilder* builder) {
 
 size_t CollectionShardingRuntime::numberOfRangesScheduledForDeletion() const {
     stdx::lock_guard lk(_metadataManagerLock);
-    if (_metadataManager) {
+    if (_metadataType == MetadataType::kSharded) {
         return _metadataManager->numberOfRangesScheduledForDeletion();
     }
     return 0;
@@ -461,7 +482,9 @@ CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx,
                                    Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
     auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
     auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr);
-    invariant(csr->getCurrentMetadataIfKnown());
+    tassert(7032305,
+            "Collection metadata unknown when entering critical section",
+            csr->getCurrentMetadataIfKnown());
     csr->enterCriticalSectionCatchUpPhase(csrLock, _reason);
 }
 
@@ -482,7 +505,9 @@ void CollectionCriticalSection::enterCommitPhase() {
                                    Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
     auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
     auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
-    invariant(csr->getCurrentMetadataIfKnown());
+    tassert(7032304,
+            "Collection metadata unknown when entering critical section commit phase",
+            csr->getCurrentMetadataIfKnown());
     csr->enterCriticalSectionCommitPhase(csrLock, _reason);
 }
 

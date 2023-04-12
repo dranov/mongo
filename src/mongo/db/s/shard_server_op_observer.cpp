@@ -80,8 +80,10 @@ bool isStandaloneOrPrimary(OperationContext* opCtx) {
  */
 class CollectionVersionLogOpHandler final : public RecoveryUnit::Change {
 public:
-    CollectionVersionLogOpHandler(OperationContext* opCtx, const NamespaceString& nss)
-        : _opCtx(opCtx), _nss(nss) {}
+    CollectionVersionLogOpHandler(OperationContext* opCtx,
+                                  const NamespaceString& nss,
+                                  bool droppingCollection)
+        : _opCtx(opCtx), _nss(nss), _droppingCollection(droppingCollection) {}
 
     void commit(boost::optional<Timestamp>) override {
         invariant(_opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_IX));
@@ -91,7 +93,11 @@ public:
         // Force subsequent uses of the namespace to refresh the filtering metadata so they can
         // synchronize with any work happening on the primary (e.g., migration critical section).
         UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
-        CollectionShardingRuntime::get(_opCtx, _nss)->clearFilteringMetadata(_opCtx);
+        if (_droppingCollection)
+            CollectionShardingRuntime::get(_opCtx, _nss)
+                ->clearFilteringMetadataForDroppedCollection(_opCtx);
+        else
+            CollectionShardingRuntime::get(_opCtx, _nss)->clearFilteringMetadata(_opCtx);
     }
 
     void rollback() override {}
@@ -99,6 +105,7 @@ public:
 private:
     OperationContext* _opCtx;
     const NamespaceString _nss;
+    const bool _droppingCollection;
 };
 
 /**
@@ -150,8 +157,8 @@ void onConfigDeleteInvalidateCachedCollectionMetadataAndNotify(OperationContext*
     AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(opCtx->lockState());
     AutoGetCollection autoColl(opCtx, deletedNss, MODE_IX);
 
-    opCtx->recoveryUnit()->registerChange(
-        std::make_unique<CollectionVersionLogOpHandler>(opCtx, deletedNss));
+    opCtx->recoveryUnit()->registerChange(std::make_unique<CollectionVersionLogOpHandler>(
+        opCtx, deletedNss, /* droppingCollection */ true));
 }
 
 /**
@@ -189,7 +196,9 @@ void incrementChunkOnInsertOrUpdate(OperationContext* opCtx,
             return balancerConfig->getMaxChunkSizeBytes();
         }();
 
-        if (balancerConfig->getShouldAutoSplit() && chunkManager.allowAutoSplit() &&
+        if (!feature_flags::gNoMoreAutoSplitter.isEnabled(
+                serverGlobalParams.featureCompatibility) &&
+            balancerConfig->getShouldAutoSplit() && chunkManager.allowAutoSplit() &&
             chunkWritesTracker->shouldSplit(maxChunkSizeBytes)) {
             auto chunkSplitStateDriver =
                 ChunkSplitStateDriver::tryInitiateSplit(chunkWritesTracker);
@@ -352,8 +361,8 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
         AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(opCtx->lockState());
         AutoGetCollection autoColl(opCtx, updatedNss, MODE_IX);
         if (refreshingFieldNewVal.isBoolean() && !refreshingFieldNewVal.boolean()) {
-            opCtx->recoveryUnit()->registerChange(
-                std::make_unique<CollectionVersionLogOpHandler>(opCtx, updatedNss));
+            opCtx->recoveryUnit()->registerChange(std::make_unique<CollectionVersionLogOpHandler>(
+                opCtx, updatedNss, /* droppingCollection */ false));
         }
 
         if (enterCriticalSectionFieldNewVal.ok()) {
@@ -390,9 +399,13 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             // TODO SERVER-58223: evaluate whether this is safe or whether acquiring the lock can
             // block.
             AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(opCtx->lockState());
+
             AutoGetDb autoDb(opCtx, db, MODE_X);
             auto dss = DatabaseShardingState::get(opCtx, db);
             dss->clearDatabaseInfo(opCtx);
+
+            const auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, dss);
+            dss->cancelDbMetadataRefresh(dssLock);
         }
     }
 
@@ -487,9 +500,13 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
 
         // TODO SERVER-58223: evaluate whether this is safe or whether acquiring the lock can block.
         AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(opCtx->lockState());
+
         AutoGetDb autoDb(opCtx, deletedDatabase, MODE_X);
         auto dss = DatabaseShardingState::get(opCtx, deletedDatabase);
         dss->clearDatabaseInfo(opCtx);
+
+        const auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, dss);
+        dss->cancelDbMetadataRefresh(dssLock);
     }
 
     if (nss == NamespaceString::kServerConfigurationNamespace) {
@@ -622,6 +639,14 @@ repl::OpTime ShardServerOpObserver::onDropCollection(OperationContext* opCtx,
     }
 
     return {};
+}
+
+void ShardServerOpObserver::onCreateIndex(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          const UUID& uuid,
+                                          BSONObj indexDoc,
+                                          bool fromMigrate) {
+    abortOngoingMigrationIfNeeded(opCtx, nss);
 }
 
 void ShardServerOpObserver::onStartIndexBuild(OperationContext* opCtx,

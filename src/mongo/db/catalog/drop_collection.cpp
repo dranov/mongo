@@ -36,9 +36,10 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_uuid_mismatch.h"
+#include "mongo/db/catalog/collection_uuid_mismatch_info.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builds_coordinator.h"
@@ -56,7 +57,16 @@ namespace {
 MONGO_FAIL_POINT_DEFINE(hangDropCollectionBeforeLockAcquisition);
 MONGO_FAIL_POINT_DEFINE(hangDuringDropCollection);
 
-Status _checkNssAndReplState(OperationContext* opCtx, const CollectionPtr& coll) {
+Status _checkNssAndReplState(OperationContext* opCtx,
+                             const CollectionPtr& coll,
+                             const NamespaceString& nss,
+                             const boost::optional<UUID>& expectedUUID = boost::none) {
+    try {
+        checkCollectionUUIDMismatch(opCtx, nss, coll, expectedUUID);
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+
     if (!coll) {
         return Status(ErrorCodes::NamespaceNotFound, "ns not found");
     }
@@ -195,18 +205,12 @@ Status _abortIndexBuildsAndDrop(OperationContext* opCtx,
 
     CollectionPtr coll =
         CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, startingNss);
-    Status status = _checkNssAndReplState(opCtx, coll);
+    Status status = _checkNssAndReplState(opCtx, coll, startingNss, expectedUUID);
     if (!status.isOK()) {
         return status;
     }
 
     warnEncryptedCollectionsIfNeeded(opCtx, coll);
-
-    try {
-        checkCollectionUUIDMismatch(opCtx, startingNss, coll, expectedUUID);
-    } catch (const DBException& ex) {
-        return ex.toStatus();
-    }
 
     if (MONGO_unlikely(hangDuringDropCollection.shouldFail())) {
         LOGV2(518090,
@@ -256,7 +260,7 @@ Status _abortIndexBuildsAndDrop(OperationContext* opCtx,
         opCtx->recoveryUnit()->abandonSnapshot();
 
         coll = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, collectionUUID);
-        status = _checkNssAndReplState(opCtx, coll);
+        status = _checkNssAndReplState(opCtx, coll, startingNss, expectedUUID);
         if (!status.isOK()) {
             return status;
         }
@@ -304,7 +308,7 @@ Status _dropCollectionForApplyOps(OperationContext* opCtx,
     Lock::CollectionLock collLock(opCtx, collectionName, MODE_X);
     const CollectionPtr& coll =
         CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, collectionName);
-    Status status = _checkNssAndReplState(opCtx, coll);
+    Status status = _checkNssAndReplState(opCtx, coll, collectionName);
     if (!status.isOK()) {
         return status;
     }
@@ -348,6 +352,7 @@ Status _dropCollection(OperationContext* opCtx,
                        const boost::optional<UUID>& expectedUUID,
                        DropReply* reply,
                        DropCollectionSystemCollectionMode systemCollectionMode,
+                       bool fromMigrate,
                        boost::optional<UUID> dropIfUUIDNotMatching = boost::none) {
 
     try {
@@ -355,7 +360,13 @@ Status _dropCollection(OperationContext* opCtx,
             AutoGetDb autoDb(opCtx, collectionName.db(), MODE_IX);
             auto db = autoDb.getDb();
             if (!db) {
-                return Status(ErrorCodes::NamespaceNotFound, "ns not found");
+                return expectedUUID
+                    ? Status{CollectionUUIDMismatchInfo(collectionName.db().toString(),
+                                                        *expectedUUID,
+                                                        collectionName.coll().toString(),
+                                                        boost::none),
+                             "Database does not exist"}
+                    : Status(ErrorCodes::NamespaceNotFound, "ns not found");
             }
 
             if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, collectionName)) {
@@ -364,13 +375,14 @@ Status _dropCollection(OperationContext* opCtx,
                     std::move(autoDb),
                     collectionName,
                     expectedUUID,
-                    [opCtx, systemCollectionMode](Database* db, const NamespaceString& resolvedNs) {
+                    [opCtx, systemCollectionMode, fromMigrate](Database* db,
+                                                               const NamespaceString& resolvedNs) {
                         WriteUnitOfWork wuow(opCtx);
 
                         auto status = systemCollectionMode ==
                                 DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops
-                            ? db->dropCollection(opCtx, resolvedNs)
-                            : db->dropCollectionEvenIfSystem(opCtx, resolvedNs);
+                            ? db->dropCollection(opCtx, resolvedNs, {}, fromMigrate)
+                            : db->dropCollectionEvenIfSystem(opCtx, resolvedNs, {}, fromMigrate);
                         if (!status.isOK()) {
                             return status;
                         }
@@ -383,14 +395,18 @@ Status _dropCollection(OperationContext* opCtx,
                     dropIfUUIDNotMatching);
             }
 
-            auto dropTimeseries = [opCtx, &expectedUUID, &autoDb, &collectionName, &reply](
-                                      const NamespaceString& bucketNs, bool dropView) {
+            auto dropTimeseries = [opCtx,
+                                   &expectedUUID,
+                                   &autoDb,
+                                   &collectionName,
+                                   &reply,
+                                   fromMigrate](const NamespaceString& bucketNs, bool dropView) {
                 return _abortIndexBuildsAndDrop(
                     opCtx,
                     std::move(autoDb),
                     bucketNs,
                     expectedUUID,
-                    [opCtx, dropView, &expectedUUID, &collectionName, &reply](
+                    [opCtx, dropView, &expectedUUID, &collectionName, &reply, fromMigrate](
                         Database* db, const NamespaceString& bucketsNs) {
                         // Disallow checking the expectedUUID when dropping time-series collections.
                         uassert(ErrorCodes::InvalidOptions,
@@ -414,11 +430,13 @@ Status _dropCollection(OperationContext* opCtx,
 
                         // Drop the buckets collection in its own writeConflictRetry so that if
                         // it throws a WCE, only the buckets collection drop is retried.
-                        writeConflictRetry(opCtx, "drop", bucketsNs.ns(), [opCtx, db, &bucketsNs] {
-                            WriteUnitOfWork wuow(opCtx);
-                            db->dropCollectionEvenIfSystem(opCtx, bucketsNs).ignore();
-                            wuow.commit();
-                        });
+                        writeConflictRetry(
+                            opCtx, "drop", bucketsNs.ns(), [opCtx, db, &bucketsNs, fromMigrate] {
+                                WriteUnitOfWork wuow(opCtx);
+                                db->dropCollectionEvenIfSystem(opCtx, bucketsNs, {}, fromMigrate)
+                                    .ignore();
+                                wuow.commit();
+                            });
 
                         return Status::OK();
                     },
@@ -468,7 +486,8 @@ Status dropCollection(OperationContext* opCtx,
                       const NamespaceString& nss,
                       const boost::optional<UUID>& expectedUUID,
                       DropReply* reply,
-                      DropCollectionSystemCollectionMode systemCollectionMode) {
+                      DropCollectionSystemCollectionMode systemCollectionMode,
+                      bool fromMigrate) {
     if (!serverGlobalParams.quiet.load()) {
         LOGV2(518070, "CMD: drop", logAttrs(nss));
     }
@@ -483,14 +502,16 @@ Status dropCollection(OperationContext* opCtx,
     const auto collectionName =
         nss.isTimeseriesBucketsCollection() ? nss.getTimeseriesViewNamespace() : nss;
 
-    return _dropCollection(opCtx, collectionName, expectedUUID, reply, systemCollectionMode);
+    return _dropCollection(
+        opCtx, collectionName, expectedUUID, reply, systemCollectionMode, fromMigrate);
 }
 
 Status dropCollection(OperationContext* opCtx,
                       const NamespaceString& nss,
                       DropReply* reply,
-                      DropCollectionSystemCollectionMode systemCollectionMode) {
-    return dropCollection(opCtx, nss, boost::none, reply, systemCollectionMode);
+                      DropCollectionSystemCollectionMode systemCollectionMode,
+                      bool fromMigrate) {
+    return dropCollection(opCtx, nss, boost::none, reply, systemCollectionMode, fromMigrate);
 }
 
 Status dropCollectionIfUUIDNotMatching(OperationContext* opCtx,
@@ -512,6 +533,7 @@ Status dropCollectionIfUUIDNotMatching(OperationContext* opCtx,
                                boost::none,
                                &repl,
                                DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops,
+                               false /*fromMigrate*/,
                                expectedUUID);
     }
 

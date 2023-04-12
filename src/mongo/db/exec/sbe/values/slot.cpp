@@ -457,7 +457,7 @@ static void serializeValueIntoKeyString(KeyString::Builder& buf, TypeTags tag, V
             // TODO SERVER-61629: convert this to serialize the 'arr' directly instead of
             // constructing a BSONArray.
             BSONArrayBuilder builder;
-            bson::convertToBsonObj(builder, getArrayView(val));
+            bson::convertToBsonObj(builder, value::ArrayEnumerator{tag, val});
             buf.appendBool(true);
             buf.appendArray(BSONArray(builder.done()));
             break;
@@ -564,8 +564,10 @@ void MaterializedRow::serializeIntoKeyString(KeyString::Builder& buf) const {
     }
 }
 
-MaterializedRow MaterializedRow::deserializeFromKeyString(const KeyString::Value& keyString,
-                                                          BufBuilder* valueBufferBuilder) {
+MaterializedRow MaterializedRow::deserializeFromKeyString(
+    const KeyString::Value& keyString,
+    BufBuilder* valueBufferBuilder,
+    boost::optional<size_t> numPrefixValsToRead) {
     BufReader reader(keyString.getBuffer(), keyString.getSize());
     KeyString::TypeBits typeBits(keyString.getTypeBits());
     KeyString::TypeBits::Reader typeBitsReader(typeBits);
@@ -577,7 +579,8 @@ MaterializedRow MaterializedRow::deserializeFromKeyString(const KeyString::Value
             &reader, &typeBitsReader, false /* inverted */, typeBits.version, &valBuilder);
     } while (keepReading);
 
-    MaterializedRow result{valBuilder.numValues()};
+    size_t sizeOfRow = numPrefixValsToRead ? *numPrefixValsToRead : valBuilder.numValues();
+    MaterializedRow result{sizeOfRow};
     valBuilder.readValues(result);
 
     return result;

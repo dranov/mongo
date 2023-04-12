@@ -40,7 +40,6 @@
 #include "mongo/s/shard_id.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/string_map.h"
-
 namespace mongo {
 
 struct SplitPolicyParams {
@@ -53,6 +52,11 @@ public:
     /**
      * Returns the optimization strategy for building initial chunks based on the input parameters
      * and the collection state.
+     *
+     * The 'useAutoSplitter' flag indicates to the initial split strategy selected that in case the
+     * collection contains data, it should use the auto splitter to chop that data into chunks
+     * respective to the configured chunk size. If set to false, the policy will create as large of
+     * chunks as possible.
      */
     static std::unique_ptr<InitialSplitPolicy> calculateOptimizationStrategy(
         OperationContext* opCtx,
@@ -62,7 +66,8 @@ public:
         const boost::optional<std::vector<BSONObj>>& initialSplitPoints,
         const std::vector<TagsType>& tags,
         size_t numShards,
-        bool collectionIsEmpty);
+        bool collectionIsEmpty,
+        bool useAutoSplitter = true /* Controlled by FCV, see the comment */);
 
     virtual ~InitialSplitPolicy() {}
 
@@ -140,7 +145,7 @@ public:
  * Split point building strategy to be used when no optimizations are available. We send a
  * splitVector command to the primary shard in order to calculate the appropriate split points.
  */
-class UnoptimizedSplitPolicy : public InitialSplitPolicy {
+class AutoSplitInChunksOnPrimaryPolicy : public InitialSplitPolicy {
 public:
     ShardCollectionConfig createFirstChunks(OperationContext* opCtx,
                                             const ShardKeyPattern& shardKeyPattern,
@@ -285,6 +290,7 @@ public:
     public:
         virtual ~SampleDocumentSource(){};
         virtual boost::optional<BSONObj> getNext() = 0;
+        virtual Pipeline* getPipeline_forTest() = 0;
     };
 
     // Provides documents from a real Pipeline
@@ -293,6 +299,9 @@ public:
         PipelineDocumentSource() = delete;
         PipelineDocumentSource(SampleDocumentPipeline pipeline, int skip);
         boost::optional<BSONObj> getNext() override;
+        Pipeline* getPipeline_forTest() override {
+            return _pipeline.get();
+        }
 
     private:
         SampleDocumentPipeline _pipeline;
@@ -328,13 +337,21 @@ public:
 
     static constexpr int kDefaultSamplesPerChunk = 10;
 
+    static std::unique_ptr<SampleDocumentSource> makePipelineDocumentSource_forTest(
+        OperationContext* opCtx,
+        const NamespaceString& ns,
+        const ShardKeyPattern& shardKey,
+        int numInitialChunks,
+        int samplesPerChunk);
+
 private:
     static std::unique_ptr<SampleDocumentSource> _makePipelineDocumentSource(
         OperationContext* opCtx,
         const NamespaceString& ns,
         const ShardKeyPattern& shardKey,
         int numInitialChunks,
-        int samplesPerChunk);
+        int samplesPerChunk,
+        MakePipelineOptions opts = {});
 
     /**
      * Returns a set of split points to ensure that chunk boundaries will align with the zone

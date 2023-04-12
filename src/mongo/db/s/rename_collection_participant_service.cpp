@@ -43,6 +43,7 @@
 #include "mongo/db/s/recoverable_critical_section_service.h"
 #include "mongo/db/s/rename_collection_participant_service.h"
 #include "mongo/db/s/shard_metadata_util.h"
+#include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
@@ -58,29 +59,11 @@ const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
  * Drop the collection locally and clear stale metadata from cache collections.
  */
 void dropCollectionLocally(OperationContext* opCtx, const NamespaceString& nss) {
-    bool knownNss = [&]() {
-        try {
-            DropCollectionCoordinator::dropCollectionLocally(opCtx, nss);
-            return true;
-        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-            return false;
-        }
-    }();
-
+    DropCollectionCoordinator::dropCollectionLocally(opCtx, nss, false /* fromMigrate */);
     LOGV2_DEBUG(5515100,
                 1,
-                "Dropped target collection locally on renameCollection participant",
-                "namespace"_attr = nss,
-                "collectionExisted"_attr = knownNss);
-}
-
-/* Clear the CollectionShardingRuntime entry for the specified namespace */
-void clearFilteringMetadata(OperationContext* opCtx, const NamespaceString& nss) {
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-    Lock::DBLock dbLock(opCtx, nss.db(), MODE_IX);
-    Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
-    auto* csr = CollectionShardingRuntime::get(opCtx, nss);
-    csr->clearFilteringMetadata(opCtx);
+                "Dropped target collection locally on renameCollection participant.",
+                "namespace"_attr = nss);
 }
 
 /*
@@ -307,9 +290,7 @@ SemiFuture<void> RenameParticipantInstance::_runImpl(
 
                 // Acquire source/target critical sections
                 const auto reason =
-                    BSON("command"
-                         << "rename"
-                         << "from" << fromNss().toString() << "to" << toNss().toString());
+                    sharding_ddl_util::getCriticalSectionReasonForRename(fromNss(), toNss());
                 auto service = RecoverableCriticalSectionService::get(opCtx);
                 service->acquireRecoverableCriticalSectionBlockWrites(
                     opCtx, fromNss(), reason, ShardingCatalogClient::kLocalWriteConcern);
@@ -324,8 +305,19 @@ SemiFuture<void> RenameParticipantInstance::_runImpl(
                 // recovered the next time is accessed) and to safely create new range deletion
                 // tasks (the submission will serialize on the renamed collection's metadata
                 // refresh).
-                clearFilteringMetadata(opCtx, fromNss());
-                clearFilteringMetadata(opCtx, toNss());
+                {
+                    Lock::DBLock dbLock(opCtx, fromNss().db(), MODE_IX);
+                    Lock::CollectionLock collLock(opCtx, fromNss(), MODE_IX);
+                    auto* csr = CollectionShardingRuntime::get(opCtx, fromNss());
+                    csr->clearFilteringMetadataForDroppedCollection(opCtx);
+                }
+
+                {
+                    Lock::DBLock dbLock(opCtx, toNss().db(), MODE_IX);
+                    Lock::CollectionLock collLock(opCtx, toNss(), MODE_IX);
+                    auto* csr = CollectionShardingRuntime::get(opCtx, toNss());
+                    csr->clearFilteringMetadata(opCtx);
+                }
 
                 snapshotRangeDeletionsForRename(opCtx, fromNss(), toNss());
             }))

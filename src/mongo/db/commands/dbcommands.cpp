@@ -58,7 +58,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -168,41 +167,6 @@ public:
         }
     };
 } cmdDropDatabase;
-
-static const char* repairRemovedMessage =
-    "This command has been removed. If you would like to compact your data, use the 'compact' "
-    "command. If you would like to rebuild indexes, use the 'reIndex' command. If you need to "
-    "recover data, please see the documentation for repairing your database offline: "
-    "http://dochub.mongodb.org/core/repair";
-
-class CmdRepairDatabase : public ErrmsgCommandDeprecated {
-public:
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
-    }
-    virtual bool maintenanceMode() const {
-        return false;
-    }
-
-    std::string help() const override {
-        return repairRemovedMessage;
-    }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-
-    CmdRepairDatabase() : ErrmsgCommandDeprecated("repairDatabase") {}
-
-    bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbname,
-                   const BSONObj& cmdObj,
-                   std::string& errmsg,
-                   BSONObjBuilder& result) {
-
-        uasserted(ErrorCodes::CommandNotFound, repairRemovedMessage);
-        return false;
-    }
-} cmdRepairDatabase;
 
 /* drop collection */
 class CmdDrop : public DropCmdVersion1Gen<CmdDrop> {
@@ -330,13 +294,19 @@ public:
         bool estimate = jsobj["estimate"].trueValue();
 
         const NamespaceString nss(ns);
-        AutoGetCollectionForReadCommand collection(opCtx, nss);
+        AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+        const auto& collection = autoColl.getCollection();
 
-        const auto collDesc =
-            CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx);
+        if (!collection) {
+            // Collection does not exist
+            result.appendNumber("size", 0);
+            result.appendNumber("numObjects", 0);
+            result.append("millis", timer.millis());
+            return true;
+        }
 
-        if (collDesc.isSharded()) {
-            const ShardKeyPattern shardKeyPattern(collDesc.getKeyPattern());
+        if (collection.isSharded()) {
+            const ShardKeyPattern shardKeyPattern(collection.getShardKeyPattern());
             uassert(ErrorCodes::BadValue,
                     "keyPattern must be empty or must be an object that equals the shard key",
                     keyPattern.isEmpty() ||
@@ -354,10 +324,7 @@ public:
             max = shardKeyPattern.normalizeShardKey(max);
         }
 
-        long long numRecords = 0;
-        if (collection) {
-            numRecords = collection->numRecords(opCtx);
-        }
+        const long long numRecords = collection->numRecords(opCtx);
 
         if (numRecords == 0) {
             result.appendNumber("size", 0);
@@ -377,7 +344,7 @@ public:
                 return 1;
             }
             exec = InternalPlanner::collectionScan(
-                opCtx, &collection.getCollection(), PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+                opCtx, &collection, PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
         } else if (min.isEmpty() || max.isEmpty()) {
             errmsg = "only one of min or max specified";
             return false;
@@ -388,7 +355,7 @@ public:
             }
 
             auto shardKeyIdx = findShardKeyPrefixedIndex(opCtx,
-                                                         *collection,
+                                                         collection,
                                                          collection->getIndexCatalog(),
                                                          keyPattern,
                                                          /*requireSingleKey=*/true);
@@ -403,12 +370,12 @@ public:
             max = Helpers::toKeyFormat(kp.extendRangeBound(max, false));
 
             exec = InternalPlanner::shardKeyIndexScan(opCtx,
-                                                      &collection.getCollection(),
+                                                      &collection,
                                                       *shardKeyIdx,
                                                       min,
                                                       max,
                                                       BoundInclusion::kIncludeStartKeyOnly,
-                                                      PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+                                                      PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
         }
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(

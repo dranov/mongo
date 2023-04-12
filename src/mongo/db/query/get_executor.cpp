@@ -1526,6 +1526,13 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
         expCtx->setIsCappedDelete();
     }
 
+    // If the parsed delete does not have a user-specified collation, set it from the collection
+    // default.
+    if (collection && parsedDelete->getRequest()->getCollation().isEmpty() &&
+        collection->getDefaultCollator()) {
+        parsedDelete->setCollator(collection->getDefaultCollator()->clone());
+    }
+
     if (collection && collection->isCapped() && opCtx->inMultiDocumentTransaction()) {
         // This check is duplicated from CollectionImpl::deleteDocument() for two reasons:
         // - Performing a remove on an empty capped collection would not call
@@ -1662,9 +1669,9 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
     deleteStageParams->canonicalQuery = cq.get();
 
     const bool batchDelete =
-        (deleteStageParams->isMulti && !deleteStageParams->fromMigrate &&
-         !deleteStageParams->returnDeleted && deleteStageParams->sort.isEmpty() &&
-         !deleteStageParams->numStatsForDoc) &&
+        (deleteStageParams->isMulti && !opCtx->inMultiDocumentTransaction() &&
+         !deleteStageParams->fromMigrate && !deleteStageParams->returnDeleted &&
+         deleteStageParams->sort.isEmpty() && !deleteStageParams->numStatsForDoc) &&
         ((gInternalBatchUserMultiDeletesForTest.load() &&
           nss.ns() == "__internalBatchedDeletesTesting.Collection0") ||
          (batchDeletesByDefault.shouldFail()));

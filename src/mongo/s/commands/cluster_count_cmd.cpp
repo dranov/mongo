@@ -284,14 +284,14 @@ private:
         BSONElement l = cmd["limit"];
 
         if (s.isNumber()) {
-            num = num - s.numberLong();
+            num = num - s.safeNumberLong();
             if (num < 0) {
                 num = 0;
             }
         }
 
         if (l.isNumber()) {
-            long long limit = l.numberLong();
+            auto limit = l.safeNumberLong();
             if (limit < 0) {
                 limit = -limit;
             }

@@ -21,7 +21,9 @@ var defragmentationUtil = (function() {
         }
 
         createAndDistributeChunks(mongos, ns, numChunks, chunkSpacing);
-        createRandomZones(mongos, ns, numZones, chunkSpacing);
+        // Created zones will line up exactly with existing chunks so as not to trigger zone
+        // violations in the balancer.
+        createRandomZones(mongos, ns, numZones);
         fillChunksToRandomSize(mongos, ns, docSizeBytes, maxChunkFillMB);
 
         const beginningNumberChunks = findChunksUtil.countChunksForNs(mongos.getDB('config'), ns);
@@ -49,19 +51,18 @@ var defragmentationUtil = (function() {
         }
     };
 
-    let createRandomZones = function(mongos, ns, numZones, chunkSpacing) {
-        for (let i = -Math.floor(numZones / 2); i < Math.ceil(numZones / 2); i++) {
+    let createRandomZones = function(mongos, ns, numZones) {
+        let existingChunks = findChunksUtil.findChunksByNs(mongos.getDB('config'), ns);
+        existingChunks = Array.shuffle(existingChunks.toArray());
+        for (let i = 0; i < numZones; i++) {
             let zoneName = "Zone" + i;
-            let shardForZone =
-                findChunksUtil
-                    .findOneChunkByNs(mongos.getDB('config'), ns, {min: {key: i * chunkSpacing}})
-                    .shard;
+            let shardForZone = existingChunks[i].shard;
             assert.commandWorked(
                 mongos.adminCommand({addShardToZone: shardForZone, zone: zoneName}));
             assert.commandWorked(mongos.adminCommand({
                 updateZoneKeyRange: ns,
-                min: {key: i * chunkSpacing},
-                max: {key: i * chunkSpacing + chunkSpacing},
+                min: existingChunks[i].min,
+                max: existingChunks[i].max,
                 zone: zoneName
             }));
         }
@@ -202,6 +203,13 @@ var defragmentationUtil = (function() {
         assert.soon(function() {
             let balancerStatus =
                 assert.commandWorked(mongos.adminCommand({balancerCollectionStatus: ns}));
+
+            if (balancerStatus.balancerCompliant) {
+                // As we can't rely on `balancerCompliant` due to orphan counter non atomic update,
+                // we need to ensure the collection is balanced by some extra checks
+                sh.awaitCollectionBalance(mongos.getCollection(ns));
+            }
+
             return balancerStatus.balancerCompliant ||
                 balancerStatus.firstComplianceViolation !== 'defragmentingChunks';
         });

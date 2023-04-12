@@ -32,6 +32,7 @@
 #include "mongo/platform/basic.h"
 
 #include <fstream>
+#include <signal.h>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -60,8 +61,10 @@
 #include "mongo/logv2/uassert_sink.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/str_escape.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/uuid.h"
 
@@ -357,6 +360,43 @@ TEST_F(LogV2Test, Basic) {
         LOGV2(4638203, "mismatch {name}", "not_name"_attr = 1);
         ASSERT(StringData(lines.back()).startsWith("Exception during log"_sd));
     }
+}
+
+namespace bl_sinks = boost::log::sinks;
+// Sink backend which will grab a mutex, then immediately segfault.
+class ConsumeSegfaultsBackend
+    : public bl_sinks::basic_formatted_sink_backend<char, bl_sinks::synchronized_feeding> {
+public:
+    static auto create() {
+        return boost::make_shared<bl_sinks::synchronous_sink<ConsumeSegfaultsBackend>>(
+            boost::make_shared<ConsumeSegfaultsBackend>());
+    }
+
+    void consume(boost::log::record_view const& rec, string_type const& formattedString) {
+        if (firstRun) {
+            firstRun = false;
+            raise(SIGSEGV);
+        } else {
+            // Reentrance of consume(), which could cause deadlock. Exit normally, causing the death
+            // test to fail.
+            exit(0);
+        }
+    }
+
+private:
+    bool firstRun = true;
+};
+
+// Test that signals thrown during logging will not hang process death. Uses the
+// ConsumeSegfaultsBackend so that upon the initial log call, ConsumeSegfaultsBackend::consume will
+// be called, sending SIGSEGV. If the signal handler incorrectly invokes the logging subsystem, the
+// ConsumeSegfaultsBackend::consume function will be again invoked, failing the test since this
+// could result in deadlock.
+DEATH_TEST_F(LogV2Test, SIGSEGVDoesNotHang, "Got signal: ") {
+    auto sink = ConsumeSegfaultsBackend::create();
+    attachSink(sink);
+    LOGV2(6384304, "will SIGSEGV {str}", "str"_attr = "sigsegv");
+    // If we get here, we didn't segfault, and the test will fail.
 }
 
 class LogV2TypesTest : public LogV2Test {
@@ -1487,6 +1527,54 @@ TEST_F(LogV2Test, JsonTruncation) {
             arrToLog.objsize());
     };
     validateArrayTruncation(mongo::fromjson(lines.back()));
+}
+
+TEST_F(LogV2Test, StringTruncation) {
+    const AtomicWord<int32_t> maxAttributeSizeKB(1);
+    auto lines = makeLineCapture(JSONFormatter(&maxAttributeSizeKB));
+
+    std::size_t maxLength = maxAttributeSizeKB.load() << 10;
+    std::string prefix(maxLength - 3, 'a');
+
+    struct TestCase {
+        std::string input;
+        std::string suffix;
+        std::string note;
+    };
+
+    TestCase tests[] = {
+        {prefix + "LMNOPQ", "LMN", "unescaped 1-byte octet"},
+        // "\n\"NOPQ" expands to "\\n\\\"NOPQ" after escape, and the limit
+        // is reached at the 2nd '\\' octet, but since it splits the "\\\""
+        // sequence, the actual truncation happens after the 'n' octet.
+        {prefix + "\n\"NOPQ", "\n", "2-byte escape sequence"},
+        // "L\vNOPQ" expands to "L\\u000bNOPQ" after escape, and the limit
+        // is reached at the 'u' octet, so the entire sequence is truncated.
+        {prefix + "L\vNOPQ", "L", "multi-byte escape sequence"},
+        {prefix + "LM\xC3\xB1PQ", "LM", "2-byte UTF-8 sequence"},
+        {prefix + "L\xE1\x9B\x8FPQ", "L", "3-byte UTF-8 sequence"},
+        {prefix + "L\xF0\x90\x8C\xBCQ", "L", "4-byte UTF-8 sequence"},
+        {prefix + "\xE1\x9B\x8E\xE1\x9B\x8F", "\xE1\x9B\x8E", "UTF-8 codepoint boundary"},
+        // The invalid UTF-8 codepoint 0xC3 is replaced with "\\ufffd", and truncated entirely
+        {prefix + "L\xC3NOPQ", "L", "escaped invalid codepoint"},
+        {std::string(maxLength, '\\'), "\\", "escaped backslash"},
+    };
+
+    for (const auto& [input, suffix, note] : tests) {
+        LOGV2(6694001, "name", "name"_attr = input);
+        BSONObj obj = fromjson(lines.back());
+
+        auto str = obj[constants::kAttributesFieldName]["name"].checkAndGetStringData();
+        std::string context = "Failed test: " + note;
+
+        ASSERT_LTE(str.size(), maxLength) << context;
+        ASSERT(str.endsWith(suffix))
+            << context << " - string " << str << " does not end with " << suffix;
+
+        auto trunc = obj[constants::kTruncatedFieldName]["name"];
+        ASSERT_EQUALS(trunc["type"].String(), typeName(BSONType::String)) << context;
+        ASSERT_EQUALS(trunc["size"].numberLong(), str::escapeForJSON(input).size()) << context;
+    }
 }
 
 TEST_F(LogV2Test, Threads) {

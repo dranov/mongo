@@ -288,6 +288,10 @@ std::pair<std::vector<BSONObj>, std::vector<BSONObj>> makeChunkAndTagUpdatesForR
 void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
                                                       const NamespaceString& nss,
                                                       const ShardKeyPattern& newShardKeyPattern) {
+    // Mark opCtx as interruptible to ensure that all reads and writes to the metadata collections
+    // under the exclusive _kChunkOpLock happen on the same term.
+    opCtx->setAlwaysInterruptAtStepDownOrUp();
+
     // Take _kChunkOpLock in exclusive mode to prevent concurrent chunk modifications and generate
     // strictly monotonously increasing collection versions
     Lock::ExclusiveLock chunkLk(opCtx, opCtx->lockState(), _kChunkOpLock);
@@ -323,79 +327,80 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
     Timestamp newTimestamp = now.clusterTime().asTimestamp();
     collType.setTimestamp(newTimestamp);
 
-    auto updateCollectionAndChunksFn = [&](OperationContext* opCtx, TxnNumber txnNumber) {
-        // Update the config.collections entry for the given namespace.
-        updateShardingCatalogEntryForCollectionInTxn(
-            opCtx, nss, collType, false /* upsert */, txnNumber);
+    auto updateCollectionAndChunksFn =
+        [this, &nss, &collType, &timers, &newFields](OperationContext* opCtx, TxnNumber txnNumber) {
+            // Update the config.collections entry for the given namespace.
+            updateShardingCatalogEntryForCollectionInTxn(
+                opCtx, nss, collType, false /* upsert */, txnNumber);
 
-        LOGV2(21933,
-              "refineCollectionShardKey updated collection entry for {namespace}: took "
-              "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
-              "refineCollectionShardKey updated collection entry",
-              "namespace"_attr = nss.ns(),
-              "durationMillis"_attr = timers->executionTimer.millis(),
-              "totalTimeMillis"_attr = timers->totalTimer.millis());
-        timers->executionTimer.reset();
+            LOGV2(21933,
+                  "refineCollectionShardKey updated collection entry for {namespace}: took "
+                  "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
+                  "refineCollectionShardKey updated collection entry",
+                  "namespace"_attr = nss.ns(),
+                  "durationMillis"_attr = timers->executionTimer.millis(),
+                  "totalTimeMillis"_attr = timers->totalTimer.millis());
+            timers->executionTimer.reset();
 
-        if (MONGO_unlikely(hangRefineCollectionShardKeyBeforeUpdatingChunks.shouldFail())) {
-            LOGV2(21934, "Hit hangRefineCollectionShardKeyBeforeUpdatingChunks failpoint");
-            hangRefineCollectionShardKeyBeforeUpdatingChunks.pauseWhileSet(opCtx);
-        }
+            if (MONGO_unlikely(hangRefineCollectionShardKeyBeforeUpdatingChunks.shouldFail())) {
+                LOGV2(21934, "Hit hangRefineCollectionShardKeyBeforeUpdatingChunks failpoint");
+                hangRefineCollectionShardKeyBeforeUpdatingChunks.pauseWhileSet(opCtx);
+            }
 
-        auto [chunkUpdates, tagUpdates] = makeChunkAndTagUpdatesForRefine(newFields);
+            auto [chunkUpdates, tagUpdates] = makeChunkAndTagUpdatesForRefine(newFields);
 
-        // Update all config.chunks entries for the given namespace by setting (i) their bounds for
-        // each new field in the refined key to MinKey (except for the global max chunk where the
-        // max bounds are set to MaxKey), and unsetting (ii) their jumbo field.
-        const auto chunksQuery = BSON(ChunkType::collectionUUID << collType.getUuid());
-        writeToConfigDocumentInTxn(
-            opCtx,
-            ChunkType::ConfigNS,
-            BatchedCommandRequest::buildPipelineUpdateOp(ChunkType::ConfigNS,
-                                                         chunksQuery,
-                                                         chunkUpdates,
-                                                         false,  // upsert
-                                                         true    // useMultiUpdate
-                                                         ),
-            txnNumber);
+            // Update all config.chunks entries for the given namespace by setting (i) their bounds
+            // for each new field in the refined key to MinKey (except for the global max chunk
+            // where the max bounds are set to MaxKey), and unsetting (ii) their jumbo field.
+            const auto chunksQuery = BSON(ChunkType::collectionUUID << collType.getUuid());
+            writeToConfigDocumentInTxn(
+                opCtx,
+                ChunkType::ConfigNS,
+                BatchedCommandRequest::buildPipelineUpdateOp(ChunkType::ConfigNS,
+                                                             chunksQuery,
+                                                             chunkUpdates,
+                                                             false,  // upsert
+                                                             true    // useMultiUpdate
+                                                             ),
+                txnNumber);
 
-        LOGV2(21935,
-              "refineCollectionShardKey: updated chunk entries for {namespace}: took "
-              "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
-              "refineCollectionShardKey: updated chunk entries",
-              "namespace"_attr = nss.ns(),
-              "durationMillis"_attr = timers->executionTimer.millis(),
-              "totalTimeMillis"_attr = timers->totalTimer.millis());
-        timers->executionTimer.reset();
+            LOGV2(21935,
+                  "refineCollectionShardKey: updated chunk entries for {namespace}: took "
+                  "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
+                  "refineCollectionShardKey: updated chunk entries",
+                  "namespace"_attr = nss.ns(),
+                  "durationMillis"_attr = timers->executionTimer.millis(),
+                  "totalTimeMillis"_attr = timers->totalTimer.millis());
+            timers->executionTimer.reset();
 
-        // Update all config.tags entries for the given namespace by setting their bounds for
-        // each new field in the refined key to MinKey (except for the global max tag where the
-        // max bounds are set to MaxKey).
-        writeToConfigDocumentInTxn(
-            opCtx,
-            TagsType::ConfigNS,
-            BatchedCommandRequest::buildPipelineUpdateOp(TagsType::ConfigNS,
-                                                         BSON("ns" << nss.ns()),
-                                                         tagUpdates,
-                                                         false,  // upsert
-                                                         true    // useMultiUpdate
-                                                         ),
-            txnNumber);
+            // Update all config.tags entries for the given namespace by setting their bounds for
+            // each new field in the refined key to MinKey (except for the global max tag where the
+            // max bounds are set to MaxKey).
+            writeToConfigDocumentInTxn(
+                opCtx,
+                TagsType::ConfigNS,
+                BatchedCommandRequest::buildPipelineUpdateOp(TagsType::ConfigNS,
+                                                             BSON("ns" << nss.ns()),
+                                                             tagUpdates,
+                                                             false,  // upsert
+                                                             true    // useMultiUpdate
+                                                             ),
+                txnNumber);
 
 
-        LOGV2(21936,
-              "refineCollectionShardKey: updated zone entries for {namespace}: took "
-              "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
-              "refineCollectionShardKey: updated zone entries",
-              "namespace"_attr = nss.ns(),
-              "durationMillis"_attr = timers->executionTimer.millis(),
-              "totalTimeMillis"_attr = timers->totalTimer.millis());
+            LOGV2(21936,
+                  "refineCollectionShardKey: updated zone entries for {namespace}: took "
+                  "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
+                  "refineCollectionShardKey: updated zone entries",
+                  "namespace"_attr = nss.ns(),
+                  "durationMillis"_attr = timers->executionTimer.millis(),
+                  "totalTimeMillis"_attr = timers->totalTimer.millis());
 
-        if (MONGO_unlikely(hangRefineCollectionShardKeyBeforeCommit.shouldFail())) {
-            LOGV2(21937, "Hit hangRefineCollectionShardKeyBeforeCommit failpoint");
-            hangRefineCollectionShardKeyBeforeCommit.pauseWhileSet(opCtx);
-        }
-    };
+            if (MONGO_unlikely(hangRefineCollectionShardKeyBeforeCommit.shouldFail())) {
+                LOGV2(21937, "Hit hangRefineCollectionShardKeyBeforeCommit failpoint");
+                hangRefineCollectionShardKeyBeforeCommit.pauseWhileSet(opCtx);
+            }
+        };
 
     auto updateCollectionAndChunksWithAPIFn =
         [collType, newFields, nss, timers](const txn_api::TransactionClient& txnClient,
@@ -558,14 +563,6 @@ void ShardingCatalogManager::configureCollectionBalancing(
     boost::optional<bool> defragmentCollection,
     boost::optional<bool> enableAutoSplitter) {
 
-    // Hold the FCV region to serialize with the setFeatureCompatibilityVersion command
-    FixedFCVRegion fcvRegion(opCtx);
-    uassert(ErrorCodes::IllegalOperation,
-            "_configsvrConfigureCollectionBalancing can only be run when the cluster is in feature "
-            "compatibility versions greater or equal than 5.3.",
-            serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-                multiversion::FeatureCompatibilityVersion::kVersion_5_3));
-
     uassert(ErrorCodes::InvalidOptions,
             "invalid configure collection balancing update",
             chunkSizeMB || defragmentCollection || enableAutoSplitter);
@@ -575,14 +572,14 @@ void ShardingCatalogManager::configureCollectionBalancing(
     {
         BSONObjBuilder setBuilder(updateCmd.subobjStart("$set"));
         if (chunkSizeMB && *chunkSizeMB != 0) {
-            // verify we got a positive integer in range [1MB, 1GB]
+            auto chunkSizeBytes = static_cast<int64_t>(*chunkSizeMB) * 1024 * 1024;
+            bool withinRange = nss == NamespaceString::kLogicalSessionsNamespace
+                ? (chunkSizeBytes > 0 && chunkSizeBytes <= 1024 * 1024 * 1024)
+                : ChunkSizeSettingsType::checkMaxChunkSizeValid(chunkSizeBytes);
             uassert(ErrorCodes::InvalidOptions,
                     str::stream() << "Chunk size '" << *chunkSizeMB << "' out of range [1MB, 1GB]",
-                    *chunkSizeMB > 0 &&
-                        *chunkSizeMB < std::numeric_limits<int32_t>::max() / (1024 * 1024) &&
-                        ChunkSizeSettingsType::checkMaxChunkSizeValid(*chunkSizeMB * 1024 * 1024));
-            setBuilder.append(CollectionType::kMaxChunkSizeBytesFieldName,
-                              *chunkSizeMB * 1024 * 1024);
+                    withinRange);
+            setBuilder.append(CollectionType::kMaxChunkSizeBytesFieldName, chunkSizeBytes);
             updatedFields++;
         }
         if (defragmentCollection) {
@@ -617,26 +614,27 @@ void ShardingCatalogManager::configureCollectionBalancing(
         // migrations
         Lock::ExclusiveLock lk(opCtx, opCtx->lockState(), _kChunkOpLock);
 
-        withTransaction(
-            opCtx, CollectionType::ConfigNS, [&](OperationContext* opCtx, TxnNumber txnNumber) {
-                const auto query = BSON(CollectionType::kNssFieldName << nss.ns());
-                const auto res = writeToConfigDocumentInTxn(
-                    opCtx,
-                    CollectionType::ConfigNS,
-                    BatchedCommandRequest::buildUpdateOp(CollectionType::ConfigNS,
-                                                         query,
-                                                         update /* update */,
-                                                         false /* upsert */,
-                                                         false /* multi */),
-                    txnNumber);
-                const auto numDocsModified = UpdateOp::parseResponse(res).getN();
-                uassert(ErrorCodes::ConflictingOperationInProgress,
-                        str::stream() << "Expected to match one doc for query " << query
-                                      << " but matched " << numDocsModified,
-                        numDocsModified == 1);
+        withTransaction(opCtx,
+                        CollectionType::ConfigNS,
+                        [this, &nss, &update](OperationContext* opCtx, TxnNumber txnNumber) {
+                            const auto query = BSON(CollectionType::kNssFieldName << nss.ns());
+                            const auto res = writeToConfigDocumentInTxn(
+                                opCtx,
+                                CollectionType::ConfigNS,
+                                BatchedCommandRequest::buildUpdateOp(CollectionType::ConfigNS,
+                                                                     query,
+                                                                     update /* update */,
+                                                                     false /* upsert */,
+                                                                     false /* multi */),
+                                txnNumber);
+                            const auto numDocsModified = UpdateOp::parseResponse(res).getN();
+                            uassert(ErrorCodes::NamespaceNotSharded,
+                                    str::stream() << "Expected to match one doc for query " << query
+                                                  << " but matched " << numDocsModified,
+                                    numDocsModified == 1);
 
-                bumpCollectionMinorVersionInTxn(opCtx, nss, txnNumber);
-            });
+                            bumpCollectionMinorVersionInTxn(opCtx, nss, txnNumber);
+                        });
         // Now any migrations that change the list of shards will see the results of the transaction
         // during refresh, so it is safe to release the chunk lock.
     }
@@ -703,7 +701,9 @@ void ShardingCatalogManager::updateTimeSeriesGranularity(OperationContext* opCtx
     cm.getAllShardIds(&shardIds);
 
     withTransaction(
-        opCtx, CollectionType::ConfigNS, [&](OperationContext* opCtx, TxnNumber txnNumber) {
+        opCtx,
+        CollectionType::ConfigNS,
+        [this, &nss, granularity, &shardIds](OperationContext* opCtx, TxnNumber txnNumber) {
             // Update granularity value in config.collections.
             auto granularityFieldName = CollectionType::kTimeseriesFieldsFieldName + "." +
                 TypeCollectionTimeseriesFields::kGranularityFieldName;

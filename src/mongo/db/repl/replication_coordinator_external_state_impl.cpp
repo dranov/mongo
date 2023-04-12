@@ -51,7 +51,7 @@
 #include "mongo/db/commands/rwc_defaults_commands_gen.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
@@ -701,7 +701,16 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
         // don't want to have this process interrupted due to us stepping down, since we
         // want to be able to cast our vote for a new primary right away. Both the write's lock
         // acquisition and the "waitUntilDurable" lock acquisition must be uninterruptible.
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+        //
+        // It is not safe to take an uninterruptible lock during STARTUP2, so we only take this lock
+        // if we are primary or secondary.  We do not have the RSTL but that is OK because we never
+        // move in to STARTUP2 from PRIMARY or SECONDARY, so the consequence of a stale state is
+        // only that we don't take an uninterruptible lock when we should.
+        auto* replCoord = ReplicationCoordinator::get(opCtx);
+
+        boost::optional<UninterruptibleLockGuard> noInterrupt;
+        if (replCoord->isInPrimaryOrSecondaryState_UNSAFE())
+            noInterrupt.emplace(opCtx->lockState());
 
         Status status = writeConflictRetry(
             opCtx,
@@ -794,6 +803,16 @@ StatusWith<OpTimeAndWallTime> ReplicationCoordinatorExternalStateImpl::loadLastO
 
 bool ReplicationCoordinatorExternalStateImpl::isSelf(const HostAndPort& host, ServiceContext* ctx) {
     return repl::isSelf(host, ctx);
+}
+
+bool ReplicationCoordinatorExternalStateImpl::isSelfFastPath(const HostAndPort& host) {
+    return repl::isSelfFastPath(host);
+}
+
+bool ReplicationCoordinatorExternalStateImpl::isSelfSlowPath(const HostAndPort& host,
+                                                             ServiceContext* ctx,
+                                                             Milliseconds timeout) {
+    return repl::isSelfSlowPath(host, ctx, timeout);
 }
 
 HostAndPort ReplicationCoordinatorExternalStateImpl::getClientHostAndPort(
@@ -919,30 +938,43 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
 
         PeriodicShardedIndexConsistencyChecker::get(_service).onStepUp(_service);
         TransactionCoordinatorService::get(_service)->onStepUp(opCtx);
-    } else if (ShardingState::get(opCtx)->enabled()) {
-        Status status = ShardingStateRecovery::recover(opCtx);
-        VectorClockMutable::get(opCtx)->recoverDirect(opCtx);
+    } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        if (ShardingState::get(opCtx)->enabled()) {
+            Status status = ShardingStateRecovery::recover(opCtx);
+            VectorClockMutable::get(opCtx)->recoverDirect(opCtx);
 
-        // If the node is shutting down or it lost quorum just as it was becoming primary, don't
-        // run the sharding onStepUp machinery. The onStepDown counterpart to these methods is
-        // already idempotent, so the machinery will remain in the stepped down state.
-        if (ErrorCodes::isShutdownError(status.code()) ||
-            ErrorCodes::isNotPrimaryError(status.code())) {
-            return;
+            // If the node is shutting down or it lost quorum just as it was becoming primary, don't
+            // run the sharding onStepUp machinery. The onStepDown counterpart to these methods is
+            // already idempotent, so the machinery will remain in the stepped down state.
+            if (ErrorCodes::isShutdownError(status.code()) ||
+                ErrorCodes::isNotPrimaryError(status.code())) {
+                return;
+            }
+            fassert(40107, status);
+
+            const auto configsvrConnStr =
+                Grid::get(opCtx)->shardRegistry()->getConfigShard()->getConnString();
+            ShardingInitializationMongoD::get(opCtx)->updateShardIdentityConfigString(
+                opCtx, configsvrConnStr);
+
+            CatalogCacheLoader::get(_service).onStepUp();
+            ChunkSplitter::get(_service).onStepUp();
+            PeriodicBalancerConfigRefresher::get(_service).onStepUp(_service);
+            TransactionCoordinatorService::get(_service)->onStepUp(opCtx);
+
+            // Note, these must be done after the configOpTime is recovered via
+            // ShardingStateRecovery::recover above, because they may trigger filtering metadata
+            // refreshes which should use the recovered configOpTime.
+            migrationutil::resubmitRangeDeletionsOnStepUp(_service);
+            migrationutil::resumeMigrationCoordinationsOnStepUp(opCtx);
+            migrationutil::resumeMigrationRecipientsOnStepUp(opCtx);
+
+            const bool scheduleAsyncRefresh = true;
+            resharding::clearFilteringMetadata(opCtx, scheduleAsyncRefresh);
         }
-        fassert(40107, status);
-
-        const auto configsvrConnStr =
-            Grid::get(opCtx)->shardRegistry()->getConfigShard()->getConnString();
-        ShardingInitializationMongoD::get(opCtx)->updateShardIdentityConfigString(opCtx,
-                                                                                  configsvrConnStr);
-
-        CatalogCacheLoader::get(_service).onStepUp();
-        ChunkSplitter::get(_service).onStepUp();
-        PeriodicBalancerConfigRefresher::get(_service).onStepUp(_service);
-        TransactionCoordinatorService::get(_service)->onStepUp(opCtx);
-
-        // Create uuid index on config.rangeDeletions if needed
+        // The code above will only be executed after a stepdown happens, however the code below
+        // needs to be executed also on startup, and the enabled check might fail in shards during
+        // startup. Create uuid index on config.rangeDeletions if needed
         auto minKeyFieldName = RangeDeletionTask::kRangeFieldName + "." + ChunkRange::kMinKey;
         auto maxKeyFieldName = RangeDeletionTask::kRangeFieldName + "." + ChunkRange::kMaxKey;
         Status indexStatus = createIndexOnConfigCollection(
@@ -965,16 +997,6 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
                 indexStatus.withContext("Failed to create index on config.rangeDeletions on "
                                         "shard's first transition to primary"));
         }
-
-        // Note, these must be done after the configOpTime is recovered via
-        // ShardingStateRecovery::recover above, because they may trigger filtering metadata
-        // refreshes which should use the recovered configOpTime.
-        migrationutil::resubmitRangeDeletionsOnStepUp(_service);
-        migrationutil::resumeMigrationCoordinationsOnStepUp(opCtx);
-        migrationutil::resumeMigrationRecipientsOnStepUp(opCtx);
-
-        const bool scheduleAsyncRefresh = true;
-        resharding::clearFilteringMetadata(opCtx, scheduleAsyncRefresh);
     } else {  // unsharded
         if (auto validator = LogicalTimeValidator::get(_service)) {
             validator->enableKeyGenerator(opCtx, true);

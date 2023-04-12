@@ -45,12 +45,9 @@ public:
     virtual ~BalancerDefragmentationPolicy() {}
 
     /**
-     * Requests the execution of the defragmentation algorithm on the specified collection.
-     * Returns true if the request is accepted, false if ignored (meaning, the specified collection
-     * is already being processed)
+     * Requests the execution of the defragmentation algorithm on the required collections.
      */
-    virtual void startCollectionDefragmentation(OperationContext* opCtx,
-                                                const CollectionType& coll) = 0;
+    virtual void startCollectionDefragmentations(OperationContext* opCtx) = 0;
 
     /**
      * Checks if the collection is currently being defragmented, and signals the defragmentation
@@ -76,11 +73,11 @@ public:
 
     /**
      * Pulls the next batch of actionable chunk migration requests, given the current internal state
-     * and the passed in list of unavaible shards.
+     * and the passed in list of available shards.
      * Every chunk migration request is then expected to be acknowledged by the balancer by issuing
      * a call to applyActionResult() (declared in ActionsStreamPolicy)
      */
     virtual MigrateInfoVector selectChunksToMove(OperationContext* opCtx,
-                                                 stdx::unordered_set<ShardId>* usedShards) = 0;
+                                                 stdx::unordered_set<ShardId>* availableShards) = 0;
 };
 }  // namespace mongo

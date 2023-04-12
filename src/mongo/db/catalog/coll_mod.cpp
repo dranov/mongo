@@ -33,6 +33,7 @@
 
 #include "mongo/db/catalog/coll_mod.h"
 
+#include "mongo/db/stats/counters.h"
 #include <boost/optional.hpp>
 #include <memory>
 
@@ -44,7 +45,7 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/coll_mod_gen.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -53,6 +54,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
+#include "mongo/db/s/shard_key_index_util.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/recovery_unit.h"
@@ -62,6 +64,7 @@
 #include "mongo/db/views/view_catalog_helpers.h"
 #include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
+#include "mongo/s/grid.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/version/releases.h"
 #include "mongo/util/visit_helper.h"
@@ -109,7 +112,7 @@ struct ParsedCollModRequest {
     boost::optional<Collection::Validator> collValidator;
     boost::optional<ValidationActionEnum> collValidationAction;
     boost::optional<ValidationLevelEnum> collValidationLevel;
-    bool recordPreImages = false;
+    boost::optional<bool> recordPreImages;
     boost::optional<ChangeStreamPreAndPostImagesOptions> changeStreamPreAndPostImagesOptions;
     int numModifications = 0;
     bool dryRun = false;
@@ -250,7 +253,8 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
                         "TTL indexes are not supported for capped collections."};
             }
             if (auto status = index_key_validate::validateExpireAfterSeconds(
-                    *cmdIndex.getExpireAfterSeconds());
+                    *cmdIndex.getExpireAfterSeconds(),
+                    index_key_validate::ValidateExpireAfterSecondsMode::kSecondaryTTLIndex);
                 !status.isOK()) {
                 return {ErrorCodes::InvalidOptions, status.reason()};
             }
@@ -337,7 +341,7 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
             if (cmrIndex->idx->unique()) {
                 indexForOplog->setUnique(boost::none);
             } else {
-                // Disallow one-step unique convertion. The user has to set
+                // Disallow one-step unique conversion. The user has to set
                 // 'prepareUnique' to true first.
                 if (!cmrIndex->idx->prepareUnique()) {
                     return Status(ErrorCodes::InvalidOptions,
@@ -363,6 +367,28 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
                 return {ErrorCodes::BadValue, "can't hide _id index"};
             }
 
+            // If the index is not hidden and we are trying to hide it, check if it is possible
+            // to drop the shard key index, so it could be possible to hide it.
+            if (!cmrIndex->idx->hidden() && *cmdIndex.getHidden()) {
+                if (auto catalogClient = Grid::get(opCtx)->catalogClient()) {
+                    try {
+                        auto shardedColl = catalogClient->getCollection(opCtx, nss);
+
+                        if (isLastNonHiddenShardKeyIndex(opCtx,
+                                                         coll,
+                                                         coll->getIndexCatalog(),
+                                                         cmrIndex->idx->indexName(),
+                                                         shardedColl.getKeyPattern().toBSON())) {
+                            return {ErrorCodes::InvalidOptions,
+                                    "Can't hide the only compatible index for this collection's "
+                                    "shard key"};
+                        }
+                    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+                        // The collection is unsharded or doesn't exist.
+                    }
+                }
+            }
+
             // Hiding a hidden index or unhiding a visible index should be treated as a no-op.
             if (cmrIndex->idx->hidden() == *cmdIndex.getHidden()) {
                 indexForOplog->setHidden(boost::none);
@@ -378,6 +404,24 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
                 cmrIndex->idx->unique()) {
                 indexForOplog->setPrepareUnique(boost::none);
             } else {
+                // Checks if the index key pattern conflicts with the shard key pattern.
+                if (auto catalogClient = Grid::get(opCtx)->catalogClient()) {
+                    try {
+                        auto shardedColl = catalogClient->getCollection(opCtx, nss);
+                        const ShardKeyPattern shardKeyPattern(shardedColl.getKeyPattern());
+                        if (!shardKeyPattern.isIndexUniquenessCompatible(
+                                cmrIndex->idx->keyPattern())) {
+                            return {ErrorCodes::InvalidOptions,
+                                    fmt::format(
+                                        "cannot set 'prepareUnique' for index {} with shard key "
+                                        "pattern {}",
+                                        cmrIndex->idx->keyPattern().toString(),
+                                        shardKeyPattern.toBSON().toString())};
+                        }
+                    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+                        // The collection is unsharded or doesn't exist.
+                    }
+                }
                 cmrIndex->indexPrepareUnique = cmdIndex.getPrepareUnique();
             }
         }
@@ -430,6 +474,11 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
                                                     validatorObj.getOwned(),
                                                     MatchExpressionParser::kDefaultSpecialFeatures,
                                                     maxFeatureCompatibilityVersion);
+
+        // Increment counters to track the usage of schema validators.
+        validatorCounters.incrementCounters(
+            cmd.kCommandName, parsed.collValidator->validatorDoc, parsed.collValidator->isOK());
+
         if (!parsed.collValidator->isOK()) {
             return parsed.collValidator->getStatus();
         }
@@ -533,7 +582,9 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
                 },
                 [&oplogEntryBuilder](std::int64_t value) {
                     oplogEntryBuilder.append(CollMod::kExpireAfterSecondsFieldName, value);
-                    return index_key_validate::validateExpireAfterSeconds(value);
+                    return index_key_validate::validateExpireAfterSeconds(
+                        value,
+                        index_key_validate::ValidateExpireAfterSecondsMode::kClusteredTTLIndex);
                 },
             },
             *expireAfterSeconds);
@@ -596,7 +647,8 @@ void _setClusteredExpireAfterSeconds(
                 if (!oldExpireAfterSeconds) {
                     auto ttlCache = &TTLCollectionCache::get(opCtx->getServiceContext());
                     opCtx->recoveryUnit()->onCommit([ttlCache, uuid = coll->uuid()](auto _) {
-                        ttlCache->registerTTLInfo(uuid, TTLCollectionCache::ClusteredId());
+                        ttlCache->registerTTLInfo(
+                            uuid, TTLCollectionCache::Info{TTLCollectionCache::ClusteredId{}});
                     });
                 }
 
@@ -846,7 +898,7 @@ Status _collModInternal(OperationContext* opCtx,
                 cmrNew.recordPreImages = false;
             }
 
-            if (cmrNew.recordPreImages) {
+            if (cmrNew.recordPreImages && *cmrNew.recordPreImages) {
                 cmrNew.changeStreamPreAndPostImagesOptions =
                     ChangeStreamPreAndPostImagesOptions(false);
             }
@@ -893,8 +945,9 @@ Status _collModInternal(OperationContext* opCtx,
                                        "Failed to set validationLevel");
         }
 
-        if (cmrNew.recordPreImages != oldCollOptions.recordPreImages) {
-            coll.getWritableCollection(opCtx)->setRecordPreImages(opCtx, cmrNew.recordPreImages);
+        if (cmrNew.recordPreImages.has_value() &&
+            *cmrNew.recordPreImages != oldCollOptions.recordPreImages) {
+            coll.getWritableCollection(opCtx)->setRecordPreImages(opCtx, *cmrNew.recordPreImages);
         }
 
         if (cmrNew.changeStreamPreAndPostImagesOptions.has_value() &&
@@ -962,6 +1015,39 @@ Status _collModInternal(OperationContext* opCtx,
 }
 
 }  // namespace
+
+bool isCollModIndexUniqueConversion(const CollModRequest& request) {
+    auto index = request.getIndex();
+    if (!index) {
+        return false;
+    }
+    if (auto indexUnique = index->getUnique(); !indexUnique) {
+        return false;
+    }
+    // Checks if the request is an actual unique conversion instead of a dry run.
+    if (auto dryRun = request.getDryRun(); dryRun && *dryRun) {
+        return false;
+    }
+    return true;
+}
+
+CollModRequest makeCollModDryRunRequest(const CollModRequest& request) {
+    CollModRequest dryRunRequest;
+    CollModIndex dryRunIndex;
+    const auto& requestIndex = request.getIndex();
+    dryRunIndex.setUnique(true);
+    if (auto keyPattern = requestIndex->getKeyPattern()) {
+        dryRunIndex.setKeyPattern(keyPattern);
+    } else if (auto name = requestIndex->getName()) {
+        dryRunIndex.setName(name);
+    }
+    if (auto uuid = request.getCollectionUUID()) {
+        dryRunRequest.setCollectionUUID(uuid);
+    }
+    dryRunRequest.setIndex(dryRunIndex);
+    dryRunRequest.setDryRun(true);
+    return dryRunRequest;
+}
 
 Status processCollModCommand(OperationContext* opCtx,
                              const NamespaceStringOrUUID& nsOrUUID,

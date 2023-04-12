@@ -355,6 +355,46 @@ TEST(DocumentGetFieldNonCaching, TraverseArray) {
     checkArrayTagIsReturned();
 }
 
+TEST(DocumentSize, ApproximateSizeIsSnapshotted) {
+    const auto rawBson = BSON("field"
+                              << "value");
+    const Document document{rawBson};
+    const auto noCacheSize = document.getApproximateSize();
+
+    // Force the cache construction, making the total size of the 'Document' bigger.
+    // 'getApproximateSize()' must still return the same value.
+    document.fillCache();
+    const auto fullCacheSizeSnapshot = document.getApproximateSize();
+    const auto fullCacheSizeCurrent = document.getCurrentApproximateSize();
+    ASSERT_EQ(noCacheSize, fullCacheSizeSnapshot);
+    ASSERT_LT(noCacheSize, fullCacheSizeCurrent);
+}
+
+TEST(DocumentSize, ApproximateSizeDuringBuildIsUpdated) {
+    MutableDocument builder;
+    builder.addField("a1", Value(1));
+    builder.addField("a2", mongo::Value(2));
+    builder.addField("a3", mongo::Value(3));
+    auto middleBuildSize = builder.getApproximateSize();
+
+    builder.addField("a4", Value(4));
+    builder.addField("a5", mongo::Value(5));
+    builder.addField("a6", mongo::Value(6));
+    auto peekSize = builder.peek().getApproximateSize();
+
+    builder.addField("a7", Value(7));
+    builder.addField("a8", mongo::Value(8));
+    builder.addField("a9", mongo::Value(9));
+    auto beforeFreezeSize = builder.getApproximateSize();
+
+    Document result = builder.freeze();
+    auto frozenSize = result.getApproximateSize();
+
+    ASSERT_LT(middleBuildSize, peekSize);
+    ASSERT_LT(peekSize, beforeFreezeSize);
+    ASSERT_EQ(beforeFreezeSize, frozenSize);
+}
+
 /** Add Document fields. */
 class AddField {
 public:
@@ -840,7 +880,8 @@ TEST(MetaFields, CopyMetadataFromCopiesAllMetadata) {
                  << "foo"
                  << "h" << 1 << "$indexKey" << BSON("y" << 1) << "$searchScoreDetails"
                  << BSON("scoreDetails"
-                         << "foo")));
+                         << "foo")
+                 << "$searchSortValues" << BSON("a" << 1)));
 
     MutableDocument destination{};
     destination.copyMetaDataFrom(source);
@@ -857,6 +898,7 @@ TEST(MetaFields, CopyMetadataFromCopiesAllMetadata) {
     ASSERT_BSONOBJ_EQ(result.metadata().getSearchScoreDetails(),
                       BSON("scoreDetails"
                            << "foo"));
+    ASSERT_BSONOBJ_EQ(result.metadata().getSearchSortValues(), BSON("a" << 1));
 }
 
 class SerializationTest : public unittest::Test {
@@ -947,6 +989,7 @@ TEST(MetaFields, ToAndFromBson) {
                                                         << "def"_sd));
     docBuilder.metadata().setSearchScoreDetails(BSON("scoreDetails"
                                                      << "foo"));
+    docBuilder.metadata().setSearchSortValues(BSON("a" << 42));
     Document doc = docBuilder.freeze();
     BSONObj obj = doc.toBsonWithMetaData();
     ASSERT_EQ(10.0, obj[Document::metaFieldTextScore].Double());
@@ -958,6 +1001,7 @@ TEST(MetaFields, ToAndFromBson) {
     ASSERT_BSONOBJ_EQ(obj[Document::metaFieldSearchScoreDetails].Obj(),
                       BSON("scoreDetails"
                            << "foo"));
+    ASSERT_BSONOBJ_EQ(BSON("a" << 42), obj[Document::metaFieldSearchSortValues].Obj());
     Document fromBson = Document::fromBsonWithMetaData(obj);
     ASSERT_TRUE(fromBson.metadata().hasTextScore());
     ASSERT_TRUE(fromBson.metadata().hasRandVal());
@@ -966,6 +1010,7 @@ TEST(MetaFields, ToAndFromBson) {
     ASSERT_BSONOBJ_EQ(BSON("scoreDetails"
                            << "foo"),
                       fromBson.metadata().getSearchScoreDetails());
+    ASSERT_BSONOBJ_EQ(BSON("a" << 42), fromBson.metadata().getSearchSortValues());
 }
 
 TEST(MetaFields, MetaFieldsIncludedInDocumentApproximateSize) {
@@ -983,8 +1028,10 @@ TEST(MetaFields, MetaFieldsIncludedInDocumentApproximateSize) {
     const size_t bigMetadataDocSize = doc2.getApproximateSize();
     ASSERT_GT(bigMetadataDocSize, smallMetadataDocSize);
 
-    // Do a sanity check on the amount of space taken by metadata in document 2.
-    ASSERT_LT(doc2.getMetadataApproximateSize(), 300U);
+    // Do a sanity check on the amount of space taken by metadata in document 2. Note that the size
+    // of certain data types may vary on different build variants, so we cannot assert on the exact
+    // size.
+    ASSERT_LT(doc2.getMetadataApproximateSize(), 400U);
 
     Document emptyDoc;
     ASSERT_LT(emptyDoc.getMetadataApproximateSize(), 100U);

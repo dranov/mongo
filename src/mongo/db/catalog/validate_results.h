@@ -30,6 +30,7 @@
 #pragma once
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -44,7 +45,6 @@ struct IndexValidateResults {
     std::vector<std::string> errors;
     std::vector<std::string> warnings;
     int64_t keysTraversed = 0;
-    int64_t keysTraversedFromFullValidate = 0;
     int64_t keysRemovedFromRecordStore = 0;
 };
 
@@ -60,6 +60,9 @@ struct ValidateResults {
     std::vector<BSONObj> extraIndexEntries;
     std::vector<BSONObj> missingIndexEntries;
     std::vector<RecordId> corruptRecords;
+    // Timestamps (startTs, startDurable, stopTs, stopDurableTs) related to records
+    // with validation errors. See WiredTigerRecordStore::printRecordMetadata().
+    std::set<Timestamp> recordTimestamps;
     long long numRemovedCorruptRecords = 0;
     long long numRemovedExtraIndexEntries = 0;
     long long numInsertedMissingIndexEntries = 0;

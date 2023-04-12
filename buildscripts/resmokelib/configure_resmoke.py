@@ -15,6 +15,7 @@ import shlex
 
 import pymongo.uri_parser
 
+from buildscripts.idl import gen_all_feature_flag_list
 from buildscripts.idl.lib import ALL_FEATURE_FLAG_FILE
 
 from buildscripts.resmokelib import config as _config
@@ -27,6 +28,7 @@ def validate_and_update_config(parser, args):
     """Validate inputs and update config module."""
     _validate_options(parser, args)
     _update_config_vars(args)
+    _update_symbolizer_secrets()
     _validate_config(parser)
     _set_logging_config()
 
@@ -51,14 +53,9 @@ def _validate_options(parser, args):
             "Cannot use --replayFile with additional test files listed on the command line invocation."
         )
 
-    if args.run_all_feature_flag_tests or args.run_all_feature_flags_no_tests:
-        if not os.path.isfile(ALL_FEATURE_FLAG_FILE):
-            parser.error(
-                "To run tests with all feature flags, the %s file must exist and be placed in"
-                " your working directory. The file can be downloaded from the artifacts tarball"
-                " in Evergreen. Alternatively, if you know which feature flags you want to enable,"
-                " you can use the --additionalFeatureFlags command line argument" %
-                ALL_FEATURE_FLAG_FILE)
+    if args.additional_feature_flags_file and not os.path.isfile(
+            args.additional_feature_flags_file):
+        parser.error("The specified additional feature flags file does not exist.")
 
     def get_set_param_errors(process_params):
         agg_set_params = collections.defaultdict(list)
@@ -184,27 +181,35 @@ be invoked as either:
 - buildscripts/resmoke.py --installDir {shlex.quote(user_config['install_dir'])}""")
         raise RuntimeError(err)
 
+    def process_feature_flag_file(path):
+        with open(path) as fd:
+            return fd.read().split()
+
     def setup_feature_flags():
         _config.RUN_ALL_FEATURE_FLAG_TESTS = config.pop("run_all_feature_flag_tests")
-        _config.RUN_ALL_FEATURE_FLAGS = config.pop("run_all_feature_flags_no_tests")
+        _config.RUN_NO_FEATURE_FLAG_TESTS = config.pop("run_no_feature_flag_tests")
+        _config.ADDITIONAL_FEATURE_FLAGS_FILE = config.pop("additional_feature_flags_file")
 
-        # Running all feature flag tests implies running the fixtures with feature flags.
         if _config.RUN_ALL_FEATURE_FLAG_TESTS:
-            _config.RUN_ALL_FEATURE_FLAGS = True
+            print("Generating: ", ALL_FEATURE_FLAG_FILE)
+            gen_all_feature_flag_list.gen_all_feature_flags_file()
 
         all_ff = []
         enabled_feature_flags = []
         try:
-            with open(ALL_FEATURE_FLAG_FILE) as fd:
-                all_ff = fd.read().split()
+            all_ff = process_feature_flag_file(ALL_FEATURE_FLAG_FILE)
         except FileNotFoundError:
             # If we ask resmoke to run with all feature flags, the feature flags file
             # needs to exist.
-            if _config.RUN_ALL_FEATURE_FLAGS:
+            if _config.RUN_ALL_FEATURE_FLAG_TESTS or _config.RUN_NO_FEATURE_FLAG_TESTS:
                 raise
 
-        if _config.RUN_ALL_FEATURE_FLAGS:
+        if _config.RUN_ALL_FEATURE_FLAG_TESTS:
             enabled_feature_flags = all_ff[:]
+
+        if _config.ADDITIONAL_FEATURE_FLAGS_FILE:
+            enabled_feature_flags.extend(
+                process_feature_flag_file(_config.ADDITIONAL_FEATURE_FLAGS_FILE))
 
         # Specify additional feature flags from the command line.
         # Set running all feature flag tests to True if this options is specified.
@@ -229,7 +234,7 @@ be invoked as either:
     _config.EXCLUDE_WITH_ANY_TAGS.extend(
         utils.default_if_none(_tags_from_list(config.pop("exclude_with_any_tags")), []))
 
-    if _config.RUN_ALL_FEATURE_FLAGS and not _config.RUN_ALL_FEATURE_FLAG_TESTS:
+    if _config.RUN_NO_FEATURE_FLAG_TESTS:
         # Don't run any feature flag tests.
         _config.EXCLUDE_WITH_ANY_TAGS.extend(all_feature_flags)
     else:
@@ -502,3 +507,13 @@ def _tags_from_list(tags_list):
             tags.extend([t for t in tag.split(",") if t != ""])
         return tags
     return None
+
+
+def _update_symbolizer_secrets():
+    """Open `expansions.yml`, get values for symbolizer secrets and update their values inside config.py ."""
+    if not _config.EVERGREEN_TASK_ID:
+        # not running on Evergreen
+        return
+    yml_data = utils.load_yaml_file(_config.EXPANSIONS_FILE)
+    _config.SYMBOLIZER_CLIENT_SECRET = yml_data.get("symbolizer_client_secret")
+    _config.SYMBOLIZER_CLIENT_ID = yml_data.get("symbolizer_client_id")

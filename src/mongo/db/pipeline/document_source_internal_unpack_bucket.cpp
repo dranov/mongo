@@ -29,6 +29,7 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
+#include "mongo/db/pipeline/document_source_sequential_document_cache.h"
 #include <algorithm>
 #include <iterator>
 
@@ -243,6 +244,7 @@ DocumentSourceInternalUnpackBucket::DocumentSourceInternalUnpackBucket(
     bool assumeNoMixedSchemaData)
     : DocumentSource(kStageNameInternal, expCtx),
       _assumeNoMixedSchemaData(assumeNoMixedSchemaData),
+
       _bucketUnpacker(std::move(bucketUnpacker)),
       _bucketMaxSpanSeconds{bucketMaxSpanSeconds} {}
 
@@ -257,6 +259,11 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalUnpackBucket::createF
     // if that's the case, no field will be added to 'bucketSpec.fieldSet' in the for-loop below.
     BucketUnpacker::Behavior unpackerBehavior = BucketUnpacker::Behavior::kExclude;
     BucketSpec bucketSpec;
+    // Use extended-range support if any individual collection requires it, even if 'specElem'
+    // doesn't mention this flag.
+    if (expCtx->getRequiresTimeseriesExtendedRangeSupport()) {
+        bucketSpec.setUsesExtendedRange(true);
+    }
     auto hasIncludeExclude = false;
     auto hasTimeField = false;
     auto hasBucketMaxSpanSeconds = false;
@@ -350,6 +357,12 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalUnpackBucket::createF
                                   << " field must be a bool, got: " << elem.type(),
                     elem.type() == BSONType::Bool);
             bucketSpec.includeMaxTimeAsMetadata = elem.boolean();
+        } else if (fieldName == kUsesExtendedRange) {
+            uassert(6646901,
+                    str::stream() << kUsesExtendedRange
+                                  << " field must be a bool, got: " << elem.type(),
+                    elem.type() == BSONType::Bool);
+            bucketSpec.setUsesExtendedRange(elem.boolean());
         } else {
             uasserted(5346506,
                       str::stream()
@@ -448,6 +461,14 @@ void DocumentSourceInternalUnpackBucket::serializeToArray(
     if (_assumeNoMixedSchemaData)
         out.addField(kAssumeNoMixedSchemaData, Value(_assumeNoMixedSchemaData));
 
+    if (spec.usesExtendedRange()) {
+        // Include this flag so that 'explain' is more helpful.
+        // But this is not so useful for communicating from one process to another,
+        // because mongos and/or the primary shard don't know whether any other shard
+        // has extended-range data.
+        out.addField(kUsesExtendedRange, Value{true});
+    }
+
     if (!spec.computedMetaProjFields().empty())
         out.addField("computedMetaProjFields", Value{[&] {
                          std::vector<Value> compFields;
@@ -510,7 +531,7 @@ bool DocumentSourceInternalUnpackBucket::pushDownComputedMetaProjection(
     if (std::next(itr) == container->end()) {
         return nextStageWasRemoved;
     }
-    if (!_bucketUnpacker.bucketSpec().metaField()) {
+    if (!_bucketUnpacker.getMetaField() || !_bucketUnpacker.includeMetaField()) {
         return nextStageWasRemoved;
     }
 
@@ -636,60 +657,70 @@ DocumentSourceInternalUnpackBucket::rewriteGroupByMinMax(Pipeline::SourceContain
         return {};
     }
 
+    if (!_bucketUnpacker.bucketSpec().metaField()) {
+        return {};
+    }
+    const auto& metaField = *_bucketUnpacker.bucketSpec().metaField();
+
     const auto& idFields = groupPtr->getIdFields();
-    if (idFields.size() != 1 || !_bucketUnpacker.bucketSpec().metaField().has_value()) {
+    if (idFields.size() != 1) {
         return {};
     }
 
     const auto& exprId = idFields.cbegin()->second;
+    // TODO: SERVER-68811. Allow rewrites if expression is constant.
     const auto* exprIdPath = dynamic_cast<const ExpressionFieldPath*>(exprId.get());
     if (exprIdPath == nullptr) {
         return {};
     }
 
     const auto& idPath = exprIdPath->getFieldPath();
-    if (idPath.getPathLength() < 2 ||
-        idPath.getFieldName(1) != _bucketUnpacker.bucketSpec().metaField().get()) {
+    if (idPath.getPathLength() < 2 || idPath.getFieldName(1) != metaField) {
         return {};
     }
 
-    bool suitable = true;
     std::vector<AccumulationStatement> accumulationStatements;
     for (const AccumulationStatement& stmt : groupPtr->getAccumulatedFields()) {
-        const auto op = stmt.expr.name;
-        const bool isMin = op == "$min";
-        const bool isMax = op == "$max";
-
-        // Rewrite is valid only for min and max aggregates.
-        if (!isMin && !isMax) {
-            suitable = false;
-            break;
-        }
-
         const auto* exprArg = stmt.expr.argument.get();
         if (const auto* exprArgPath = dynamic_cast<const ExpressionFieldPath*>(exprArg)) {
             const auto& path = exprArgPath->getFieldPath();
-            if (path.getPathLength() <= 1 ||
-                path.getFieldName(1) == _bucketUnpacker.bucketSpec().timeField()) {
+            if (path.getPathLength() <= 1) {
+                return {};
+            }
+
+            const auto& rootFieldName = path.getFieldName(1);
+            if (rootFieldName == _bucketUnpacker.bucketSpec().timeField()) {
                 // Rewrite not valid for time field. We want to eliminate the bucket
                 // unpack stage here.
-                suitable = false;
-                break;
+                return {};
             }
 
-            // Update aggregates to reference the control field.
             std::ostringstream os;
-            if (isMin) {
-                os << timeseries::kControlMinFieldNamePrefix;
-            } else {
-                os << timeseries::kControlMaxFieldNamePrefix;
-            }
+            if (rootFieldName == metaField) {
+                // Update aggregates to reference the meta field.
+                os << timeseries::kBucketMetaFieldName;
 
-            for (size_t index = 1; index < path.getPathLength(); index++) {
-                if (index > 1) {
-                    os << ".";
+                for (size_t index = 2; index < path.getPathLength(); index++) {
+                    os << "." << path.getFieldName(index);
                 }
-                os << path.getFieldName(index);
+            } else {
+                // Update aggregates to reference the control field.
+                const auto op = stmt.expr.name;
+                if (op == "$min") {
+                    os << timeseries::kControlMinFieldNamePrefix;
+                } else if (op == "$max") {
+                    os << timeseries::kControlMaxFieldNamePrefix;
+                } else {
+                    // Rewrite is valid only for min and max aggregates.
+                    return {};
+                }
+
+                for (size_t index = 1; index < path.getPathLength(); index++) {
+                    if (index > 1) {
+                        os << ".";
+                    }
+                    os << path.getFieldName(index);
+                }
             }
 
             const auto& newExpr = ExpressionFieldPath::createPathFromString(
@@ -698,38 +729,35 @@ DocumentSourceInternalUnpackBucket::rewriteGroupByMinMax(Pipeline::SourceContain
             AccumulationExpression accExpr = stmt.expr;
             accExpr.argument = newExpr;
             accumulationStatements.emplace_back(stmt.fieldName, std::move(accExpr));
-        }
-    }
-
-    if (suitable) {
-        std::ostringstream os;
-        os << timeseries::kBucketMetaFieldName;
-        for (size_t index = 2; index < idPath.getPathLength(); index++) {
-            os << "." << idPath.getFieldName(index);
-        }
-        auto exprId1 = ExpressionFieldPath::createPathFromString(
-            pExpCtx.get(), os.str(), pExpCtx->variablesParseState);
-
-        auto newGroup = DocumentSourceGroup::create(pExpCtx,
-                                                    std::move(exprId1),
-                                                    std::move(accumulationStatements),
-                                                    groupPtr->getMaxMemoryUsageBytes());
-
-        // Erase current stage and following group stage, and replace with updated
-        // group.
-        container->erase(std::next(itr));
-        *itr = std::move(newGroup);
-
-        if (itr == container->begin()) {
-            // Optimize group stage.
-            return {true, itr};
         } else {
-            // Give chance of the previous stage to optimize against group stage.
-            return {true, std::prev(itr)};
+            return {};
         }
     }
 
-    return {};
+    std::ostringstream os;
+    os << timeseries::kBucketMetaFieldName;
+    for (size_t index = 2; index < idPath.getPathLength(); index++) {
+        os << "." << idPath.getFieldName(index);
+    }
+    auto exprId1 = ExpressionFieldPath::createPathFromString(
+        pExpCtx.get(), os.str(), pExpCtx->variablesParseState);
+
+    auto newGroup = DocumentSourceGroup::create(pExpCtx,
+                                                std::move(exprId1),
+                                                std::move(accumulationStatements),
+                                                groupPtr->getMaxMemoryUsageBytes());
+
+    // Erase current stage and following group stage, and replace with updated group.
+    container->erase(std::next(itr));
+    *itr = std::move(newGroup);
+
+    if (itr == container->begin()) {
+        // Optimize group stage.
+        return {true, itr};
+    } else {
+        // Give chance of the previous stage to optimize against group stage.
+        return {true, std::prev(itr)};
+    }
 }
 
 bool DocumentSourceInternalUnpackBucket::haveComputedMetaField() const {
@@ -980,6 +1008,15 @@ bool DocumentSourceInternalUnpackBucket::optimizeLastpoint(Pipeline::SourceConta
         tryInsertBucketLevelSortAndGroup(AccumulatorDocumentsNeeded::kLastDocument);
 }
 
+
+bool findSequentialDocumentCache(Pipeline::SourceContainer::iterator start,
+                                 Pipeline::SourceContainer::iterator end) {
+    while (start != end && !dynamic_cast<DocumentSourceSequentialDocumentCache*>(start->get())) {
+        start = std::next(start);
+    }
+    return start != end;
+}
+
 Pipeline::SourceContainer::iterator DocumentSourceInternalUnpackBucket::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this);
@@ -1073,8 +1110,19 @@ Pipeline::SourceContainer::iterator DocumentSourceInternalUnpackBucket::doOptimi
             // the first stage, because it expects to use a special DocumentSouceGeoNearCursor plan.
             nextStage->optimizeAt(std::next(itr), container);
         }
+        auto cacheFound = findSequentialDocumentCache(itr, container->end());
+        if (cacheFound) {
+            // optimizeAt() is responsible for reordering stages, and optimize() is responsible for
+            // simplifying individual stages. $sequentialCache's optimizeAt() places the stage where
+            // it can cache as big a prefix of the pipeline as possible. To do so correctly, it
+            // needs to look at dependencies: a stage that depends on a let-variable cannot be
+            // cached. But optimize() can inline variables. Therefore, we want to avoid calling
+            // optimize() before $sequentialCache has a chance to run optimizeAt().
+            return Pipeline::optimizeAtEndOfPipeline(itr, container);
+        } else {
+            Pipeline::optimizeEndOfPipeline(itr, container);
+        }
 
-        Pipeline::optimizeEndOfPipeline(itr, container);
         if (std::next(itr) == container->end()) {
             return container->end();
         } else {
@@ -1187,8 +1235,8 @@ DocumentSource::GetModPathsReturn DocumentSourceInternalUnpackBucket::getModifie
         StringMap<std::string> renames;
         renames.emplace(*_bucketUnpacker.bucketSpec().metaField(),
                         timeseries::kBucketMetaFieldName);
-        return {GetModPathsReturn::Type::kAllExcept, std::set<std::string>{}, std::move(renames)};
+        return {GetModPathsReturn::Type::kAllExcept, OrderedPathSet{}, std::move(renames)};
     }
-    return {GetModPathsReturn::Type::kAllPaths, std::set<std::string>{}, {}};
+    return {GetModPathsReturn::Type::kAllPaths, OrderedPathSet{}, {}};
 }
 }  // namespace mongo

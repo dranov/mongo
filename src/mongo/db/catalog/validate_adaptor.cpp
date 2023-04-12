@@ -41,7 +41,7 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_consistency.h"
 #include "mongo/db/catalog/throttle_cursor.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -63,6 +63,7 @@ namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(crashOnMultikeyValidateFailure);
+MONGO_FAIL_POINT_DEFINE(failIndexKeyOrdering);
 
 // Set limit for size of corrupted records that will be reported.
 const long long kMaxErrorSizeBytes = 1 * 1024 * 1024;
@@ -129,6 +130,24 @@ void schemaValidationFailed(CollectionValidation::ValidateState* state,
     }
 }
 
+
+BSONObj rehydrateKey(const BSONObj& keyPattern, const BSONObj& indexKey) {
+    // We need to rehydrate the indexKey for improved readability.
+    // {"": ObjectId(...)} -> {"_id": ObjectId(...)}
+    auto keysIt = keyPattern.begin();
+    auto valuesIt = indexKey.begin();
+
+    BSONObjBuilder b;
+    while (keysIt != keyPattern.end()) {
+        // keysIt and valuesIt must have the same number of elements.
+        invariant(valuesIt != indexKey.end());
+        b.appendAs(*valuesIt, keysIt->fieldName());
+        keysIt++;
+        valuesIt++;
+    }
+
+    return b.obj();
+}
 }  // namespace
 
 Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
@@ -143,7 +162,7 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
     BSONObj recordBson = record.toBson();
     *dataSize = recordBson.objsize();
 
-    if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
+    if (MONGO_unlikely(_validateState->logDiagnostics())) {
         LOGV2(4666601, "[validate]", "recordId"_attr = recordId, "recordData"_attr = recordBson);
     }
 
@@ -187,6 +206,26 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
             {multikeyMetadataKeys->begin(), multikeyMetadataKeys->end()},
             *documentMultikeyPaths);
 
+        auto printMultikeyMetadata = [&]() {
+            LOGV2(7556100,
+                  "Index is not multikey but document has multikey data",
+                  "indexName"_attr = descriptor->indexName(),
+                  "recordId"_attr = recordId,
+                  "record"_attr = redact(recordBson));
+            for (auto& key : *documentKeySet) {
+                auto indexKey = KeyString::toBsonSafe(key.getBuffer(),
+                                                      key.getSize(),
+                                                      iam->getSortedDataInterface()->getOrdering(),
+                                                      key.getTypeBits());
+                const BSONObj rehydratedKey = rehydrateKey(descriptor->keyPattern(), indexKey);
+                LOGV2(7556101,
+                      "Index key for document with multikey inconsistency",
+                      "indexName"_attr = descriptor->indexName(),
+                      "recordId"_attr = recordId,
+                      "indexKey"_attr = redact(rehydratedKey));
+            }
+        };
+
         if (!index->isMultikey(opCtx, coll) && shouldBeMultikey) {
             if (_validateState->fixErrors()) {
                 writeConflictRetry(opCtx, "setIndexAsMultikey", coll->ns().ns(), [&] {
@@ -204,10 +243,17 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                                                           << " set to multikey.");
                 results->repaired = true;
             } else {
+                printMultikeyMetadata();
+
                 auto& curRecordResults = (results->indexResultsMap)[descriptor->indexName()];
-                std::string msg = str::stream() << "Index " << descriptor->indexName()
-                                                << " is not multikey but has more than one"
-                                                << " key in document " << recordId;
+                const std::string msg = fmt::format(
+                    "Index {} is not multikey but document with RecordId({}) and {} has multikey "
+                    "data, "
+                    "{} key(s)",
+                    descriptor->indexName(),
+                    recordId.toString(),
+                    recordBson.getField("_id").toString(),
+                    documentKeySet->size());
                 curRecordResults.errors.push_back(msg);
                 curRecordResults.valid = false;
                 if (crashOnMultikeyValidateFailure.shouldFail()) {
@@ -235,6 +281,8 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                                                               << " multikey paths updated.");
                     results->repaired = true;
                 } else {
+                    printMultikeyMetadata();
+
                     std::string msg = str::stream()
                         << "Index " << descriptor->indexName()
                         << " multikey paths do not cover a document. RecordId: " << recordId;
@@ -267,7 +315,7 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
         for (const auto& keyString : *documentKeySet) {
             try {
                 _totalIndexKeys++;
-                _indexConsistency->addDocKey(opCtx, keyString, &indexInfo, recordId);
+                _indexConsistency->addDocKey(opCtx, keyString, &indexInfo, recordId, results);
             } catch (...) {
                 return exceptionToStatus();
             }
@@ -288,7 +336,7 @@ void _validateKeyOrder(OperationContext* opCtx,
 
     // KeyStrings will be in strictly increasing order because all keys are sorted and they are in
     // the format (Key, RID), and all RecordIDs are unique.
-    if (currKey.compare(prevKey) <= 0) {
+    if (currKey.compare(prevKey) <= 0 || MONGO_unlikely(failIndexKeyOrdering.shouldFail())) {
         if (results && results->valid) {
             results->errors.push_back(str::stream()
                                       << "index '" << descriptor->indexName()
@@ -569,11 +617,6 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         dataSizeTotal += dataSize;
         size_t validatedSize = 0;
         Status status = validateRecord(opCtx, record->id, record->data, &validatedSize, results);
-
-        // RecordStores are required to return records in RecordId order.
-        if (prevRecordId.isValid()) {
-            invariant(prevRecordId < record->id);
-        }
 
         // validatedSize = dataSize is not a general requirement as some storage engines may use
         // padding, but we still require that they return the unpadded record data.

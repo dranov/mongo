@@ -299,7 +299,7 @@ void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) const {
     CollectionCatalog::CollectionInfoFn callback = [&](const CollectionPtr& collection) {
         try {
             WriteUnitOfWork wuow(opCtx);
-            Status status = dropCollection(opCtx, collection->ns(), {});
+            Status status = dropCollection(opCtx, collection->ns(), {}, false);
             if (!status.isOK()) {
                 LOGV2_WARNING(20327,
                               "could not drop temp collection '{namespace}': {error}",
@@ -438,7 +438,8 @@ Status DatabaseImpl::dropView(OperationContext* opCtx, NamespaceString viewName)
 
 Status DatabaseImpl::dropCollection(OperationContext* opCtx,
                                     NamespaceString nss,
-                                    repl::OpTime dropOpTime) const {
+                                    repl::OpTime dropOpTime,
+                                    bool markFromMigrate) const {
     // Cannot drop uncommitted collections.
     invariant(!UncommittedCatalogUpdates::isCreatedCollection(opCtx, nss));
 
@@ -474,7 +475,7 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx,
         }
     }
 
-    return dropCollectionEvenIfSystem(opCtx, nss, dropOpTime);
+    return dropCollectionEvenIfSystem(opCtx, nss, dropOpTime, markFromMigrate);
 }
 
 Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
@@ -744,7 +745,7 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
                                              const CollectionOptions& options) const {
     if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)) {
         if (options.isView()) {
-            uasserted(17399,
+            uasserted(ErrorCodes::NamespaceExists,
                       str::stream()
                           << "Cannot create collection " << nss << " - collection already exists.");
         } else {
@@ -1088,6 +1089,10 @@ Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
                                                               std::move(expCtx),
                                                               ExtensionsCallbackNoop(),
                                                               allowedFeatures);
+
+        // Increment counters to track the usage of schema validators.
+        validatorCounters.incrementCounters(
+            "create", collectionOptions.validator, statusWithMatcher.isOK());
 
         // We check the status of the parse to see if there are any banned features, but we don't
         // actually need the result for now.

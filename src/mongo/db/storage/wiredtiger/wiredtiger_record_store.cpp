@@ -44,8 +44,8 @@
 #include "mongo/base/static_assert.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/catalog/validate_results.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/locker.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
@@ -134,6 +134,7 @@ std::size_t computeRecordIdSize(const RecordId& id) {
 }  // namespace
 
 MONGO_FAIL_POINT_DEFINE(WTCompactRecordStoreEBUSY);
+MONGO_FAIL_POINT_DEFINE(WTRecordStoreUassertOutOfOrder);
 MONGO_FAIL_POINT_DEFINE(WTWriteConflictException);
 MONGO_FAIL_POINT_DEFINE(WTWriteConflictExceptionForReads);
 MONGO_FAIL_POINT_DEFINE(slowOplogSamplingReads);
@@ -648,7 +649,7 @@ void WiredTigerRecordStore::OplogStones::adjust(int64_t maxSize) {
 StatusWith<std::string> WiredTigerRecordStore::parseOptionsField(const BSONObj options) {
     StringBuilder ss;
     BSONForEach(elem, options) {
-        if (elem.fieldNameStringData() == "configString") {
+        if (elem.fieldNameStringData() == WiredTigerUtil::kConfigStringField) {
             Status status = WiredTigerUtil::checkTableCreationOptions(elem);
             if (!status.isOK()) {
                 return status;
@@ -801,7 +802,11 @@ StatusWith<std::string> WiredTigerRecordStore::generateCreateString(
             ident.startsWith("internal-") ||
             // TODO (SERVER-60753): Remove special handling for index build during recovery. This
             // includes the following _mdb_catalog ident.
-            nss == NamespaceString::kIndexBuildEntryNamespace || ident.startsWith("_mdb_catalog")) {
+            nss == NamespaceString::kIndexBuildEntryNamespace ||
+            // SERVER-68330: Reconstructing config.transactions after a rollback does a mixed-mode
+            // write.
+            nss == NamespaceString::kSessionTransactionsTableNamespace ||
+            ident.startsWith("_mdb_catalog")) {
             ss << "write_timestamp_usage=mixed_mode,";
         } else {
             ss << "write_timestamp_usage=ordered,";
@@ -1046,7 +1051,8 @@ bool WiredTigerRecordStore::inShutdown() const {
 }
 
 long long WiredTigerRecordStore::dataSize(OperationContext* opCtx) const {
-    return _sizeInfo->dataSize.load();
+    auto dataSize = _sizeInfo->dataSize.load();
+    return dataSize > 0 ? dataSize : 0;
 }
 
 long long WiredTigerRecordStore::numRecords(OperationContext* opCtx) const {
@@ -1157,8 +1163,7 @@ void WiredTigerRecordStore::doDeleteRecord(OperationContext* opCtx, const Record
     auto keyLength = computeRecordIdSize(id);
     metricsCollector.incrementOneDocWritten(old_length + keyLength);
 
-    _changeNumRecords(opCtx, -1);
-    _increaseDataSize(opCtx, -old_length);
+    _changeNumRecordsAndDataSize(opCtx, -1, -old_length);
 }
 
 Timestamp WiredTigerRecordStore::getPinnedOplog() const {
@@ -1283,8 +1288,7 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx, Timestamp mayT
             invariantWTOK(cursor->reset(cursor), cursor->session);
             setKey(cursor, &truncateUpToKey);
             invariantWTOK(session->truncate(session, nullptr, nullptr, cursor, nullptr), session);
-            _changeNumRecords(opCtx, -stone->records);
-            _increaseDataSize(opCtx, -stone->bytes);
+            _changeNumRecordsAndDataSize(opCtx, -stone->records, -stone->bytes);
 
             wuow.commit();
 
@@ -1424,9 +1428,7 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
             metricsCollector.incrementOneDocWritten(value.size + keyLength);
         }
     }
-
-    _changeNumRecords(opCtx, nRecords);
-    _increaseDataSize(opCtx, totalLength);
+    _changeNumRecordsAndDataSize(opCtx, nRecords, totalLength);
 
     if (_oplogStones) {
         _oplogStones->updateCurrentStoneAfterInsertOnCommit(
@@ -1601,7 +1603,7 @@ Status WiredTigerRecordStore::doUpdateRecord(OperationContext* opCtx,
     }
     invariantWTOK(ret, c->session);
 
-    _increaseDataSize(opCtx, len - old_length);
+    _changeNumRecordsAndDataSize(opCtx, 0, len - old_length);
     return Status::OK();
 }
 
@@ -1658,9 +1660,8 @@ StatusWith<RecordData> WiredTigerRecordStore::doUpdateWithDamages(
 }
 
 void WiredTigerRecordStore::printRecordMetadata(OperationContext* opCtx,
-                                                const RecordId& recordId) const {
-    LOGV2(6120300, "Printing record metadata", "recordId"_attr = recordId);
-
+                                                const RecordId& recordId,
+                                                std::set<Timestamp>* recordTimestamps) const {
     // Printing the record metadata requires a new session. We cannot open other cursors when there
     // are open history store cursors in the session.
     WiredTigerSession session(_kvEngine->getConnection());
@@ -1705,7 +1706,7 @@ void WiredTigerRecordStore::printRecordMetadata(OperationContext* opCtx,
                       cursor->session);
 
         RecordData recordData(static_cast<const char*>(value.data), value.size);
-        LOGV2(6120301,
+        LOGV2(6120300,
               "WiredTiger record metadata",
               "recordId"_attr = recordId,
               "startTxnId"_attr = startTxnId,
@@ -1719,6 +1720,20 @@ void WiredTigerRecordStore::printRecordMetadata(OperationContext* opCtx,
               "flags"_attr = flags,
               "location"_attr = location,
               "value"_attr = redact(recordData.toBson()));
+
+        // Save all relevant timestamps that we just printed.
+        if (recordTimestamps) {
+            auto saveRecordTimestampIfValid = [recordTimestamps](Timestamp ts) {
+                if (ts.isNull() || ts == Timestamp::max() || ts == Timestamp::min()) {
+                    return;
+                }
+                (void)recordTimestamps->emplace(ts);
+            };
+            saveRecordTimestampIfValid(Timestamp(startTs));
+            saveRecordTimestampIfValid(Timestamp(startDurableTs));
+            saveRecordTimestampIfValid(Timestamp(stopTs));
+            saveRecordTimestampIfValid(Timestamp(stopDurableTs));
+        }
 
         ret = cursor->next(cursor);
     }
@@ -1742,8 +1757,7 @@ Status WiredTigerRecordStore::doTruncate(OperationContext* opCtx) {
     WT_SESSION* session = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
     invariantWTOK(WT_OP_CHECK(session->truncate(session, nullptr, start, nullptr, nullptr)),
                   session);
-    _changeNumRecords(opCtx, -numRecords(opCtx));
-    _increaseDataSize(opCtx, -dataSize(opCtx));
+    _changeNumRecordsAndDataSize(opCtx, -numRecords(opCtx), -dataSize(opCtx));
 
     if (_oplogStones) {
         _oplogStones->clearStonesOnCommit(opCtx);
@@ -1974,7 +1988,9 @@ RecordId WiredTigerRecordStore::_nextId(OperationContext* opCtx) {
     return out;
 }
 
-void WiredTigerRecordStore::_changeNumRecords(OperationContext* opCtx, int64_t diff) {
+void WiredTigerRecordStore::_changeNumRecordsAndDataSize(OperationContext* opCtx,
+                                                         int64_t numRecordDiff,
+                                                         int64_t dataSizeDiff) {
     if (!_tracksSizeAdjustments) {
         return;
     }
@@ -1983,32 +1999,23 @@ void WiredTigerRecordStore::_changeNumRecords(OperationContext* opCtx, int64_t d
         return;
     }
 
-    opCtx->recoveryUnit()->onRollback([this, diff]() {
-        LOGV2_DEBUG(
-            22404, 3, "WiredTigerRecordStore: rolling back NumRecordsChange", "diff"_attr = -diff);
-        _sizeInfo->numRecords.addAndFetch(-diff);
+    const auto updateAndStoreSizeInfo = [this](int64_t numRecordDiff, int64_t dataSizeDiff) {
+        _sizeInfo->numRecords.addAndFetch(numRecordDiff);
+        _sizeInfo->dataSize.addAndFetch(dataSizeDiff);
+
+        if (_sizeStorer)
+            _sizeStorer->store(_uri, _sizeInfo);
+    };
+
+    opCtx->recoveryUnit()->onRollback([updateAndStoreSizeInfo, numRecordDiff, dataSizeDiff]() {
+        LOGV2_DEBUG(7105300,
+                    3,
+                    "WiredTigerRecordStore: rolling back change to numRecords and dataSize",
+                    "numRecordDiff"_attr = -numRecordDiff,
+                    "dataSizeDiff"_attr = -dataSizeDiff);
+        updateAndStoreSizeInfo(-numRecordDiff, -dataSizeDiff);
     });
-    _sizeInfo->numRecords.addAndFetch(diff);
-}
-
-void WiredTigerRecordStore::_increaseDataSize(OperationContext* opCtx, int64_t amount) {
-    if (!_tracksSizeAdjustments) {
-        return;
-    }
-
-    if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(getIdent())) {
-        return;
-    }
-
-    if (opCtx)
-        opCtx->recoveryUnit()->onRollback(
-            [this, amount]() { _increaseDataSize(nullptr, -amount); });
-
-    if (_sizeInfo->dataSize.fetchAndAdd(amount) < 0)
-        _sizeInfo->dataSize.store(std::max(amount, int64_t(0)));
-
-    if (_sizeStorer)
-        _sizeStorer->store(_uri, _sizeInfo);
+    updateAndStoreSizeInfo(numRecordDiff, dataSizeDiff);
 }
 
 void WiredTigerRecordStore::setNumRecords(long long numRecords) {
@@ -2092,8 +2099,7 @@ void WiredTigerRecordStore::doCappedTruncateAfter(OperationContext* opCtx,
     WT_SESSION* session = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
     invariantWTOK(session->truncate(session, nullptr, start, nullptr, nullptr), session);
 
-    _changeNumRecords(opCtx, -recordsRemoved);
-    _increaseDataSize(opCtx, -bytesRemoved);
+    _changeNumRecordsAndDataSize(opCtx, -recordsRemoved, -bytesRemoved);
 
     wuow.commit();
 
@@ -2219,20 +2225,23 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
         return {};
     }
 
-    if (_forward && _lastReturnedId >= id) {
-        LOGV2_ERROR(22406,
-                    "WTCursor::next -- c->next_key ( {next}) was not greater than _lastReturnedId "
-                    "({last}) which is a bug.",
-                    "WTCursor::next -- next was not greater than last which is a bug",
-                    "next"_attr = id,
-                    "last"_attr = _lastReturnedId);
+    const bool failWithOutOfOrderForTest = WTRecordStoreUassertOutOfOrder.shouldFail();
+    if ((_forward && _lastReturnedId >= id) || MONGO_unlikely(failWithOutOfOrderForTest)) {
+        if (!failWithOutOfOrderForTest) {
+            // Crash when testing diagnostics are enabled and not explicitly uasserting on
+            // out-of-order keys.
+            invariant(!TestingProctor::instance().isEnabled(), "cursor returned out-of-order keys");
+        }
 
-        // Crash when testing diagnostics are enabled.
-        invariant(!TestingProctor::instance().isEnabled(), "next was not greater than last");
-
-        // Force a retry of the operation from our last known position by acting as-if
-        // we received a WT_ROLLBACK error.
-        throw WriteConflictException();
+        // uassert with 'DataCorruptionDetected' after logging.
+        LOGV2_ERROR_OPTIONS(22406,
+                            {logv2::UserAssertAfterLog(ErrorCodes::DataCorruptionDetected)},
+                            "WT_Cursor::next -- returned out-of-order keys",
+                            "forward"_attr = _forward,
+                            "next"_attr = id,
+                            "last"_attr = _lastReturnedId,
+                            "ident"_attr = _rs._ident,
+                            "ns"_attr = _rs.ns());
     }
 
     WT_ITEM value;

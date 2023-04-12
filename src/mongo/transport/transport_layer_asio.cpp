@@ -296,8 +296,11 @@ TransportLayerASIO::Options::Options(const ServerGlobalParams* params,
       maxConns(params->maxConns) {
 }
 
-TransportLayerASIO::TimerService::TimerService()
-    : _reactor(std::make_shared<TransportLayerASIO::ASIOReactor>()) {}
+TransportLayerASIO::TimerService::TimerService(Options opt)
+    : _reactor(std::make_shared<TransportLayerASIO::ASIOReactor>()) {
+    if (opt.spawn)
+        _spawn = std::move(opt.spawn);
+}
 
 TransportLayerASIO::TimerService::~TimerService() {
     stop();
@@ -315,10 +318,13 @@ void TransportLayerASIO::TimerService::start() {
     auto lk = stdx::lock_guard(_mutex);
     auto precondition = State::kInitialized;
     if (_state.compareAndSwap(&precondition, State::kStarted)) {
-        _thread = stdx::thread([reactor = _reactor] {
+        _thread = _spawn([reactor = _reactor] {
             LOGV2_INFO(5490002, "Started a new thread for the timer service");
             reactor->run();
-            LOGV2_INFO(5490003, "Returning from the timer service thread");
+
+            if (!serverGlobalParams.quiet.load()) {
+                LOGV2_INFO(5490003, "Returning from the timer service thread");
+            }
         });
     }
 }
@@ -1295,9 +1301,10 @@ void TransportLayerASIO::_runListener() noexcept {
 
 Status TransportLayerASIO::start() {
     stdx::unique_lock lk(_mutex);
-
-    // Make sure we haven't shutdown already
-    invariant(!_isShutdown);
+    if (_isShutdown) {
+        LOGV2(6986801, "Cannot start an already shutdown TransportLayer");
+        return ShutdownStatus;
+    }
 
     if (_listenerOptions.isIngress()) {
         _listener.thread = stdx::thread([this] { _runListener(); });
@@ -1316,7 +1323,6 @@ void TransportLayerASIO::shutdown() {
         // We were already stopped
         return;
     }
-
     lk.unlock();
     _timerService->stop();
     lk.lock();

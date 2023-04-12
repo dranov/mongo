@@ -58,6 +58,9 @@ void writeDecisionPersistedState(OperationContext* opCtx,
                                  OID newCollectionEpoch,
                                  Timestamp newCollectionTimestamp);
 
+void updateTagsDocsForTempNss(OperationContext* opCtx,
+                              const ReshardingCoordinatorDocument& coordinatorDoc);
+
 void insertCoordDocAndChangeOrigCollEntry(OperationContext* opCtx,
                                           const ReshardingCoordinatorDocument& coordinatorDoc);
 
@@ -404,11 +407,10 @@ private:
      * Does the following writes:
      * 1. Updates the config.collections entry for the new sharded collection
      * 2. Updates config.chunks entries for the new sharded collection
-     * 3. Updates config.tags for the new sharded collection
      *
      * Transitions to 'kCommitting'.
      */
-    Future<void> _commit(const ReshardingCoordinatorDocument& updatedDoc);
+    void _commit(const ReshardingCoordinatorDocument& updatedDoc);
 
     /**
      * Waits on _reshardingCoordinatorObserver to notify that:
@@ -534,6 +536,13 @@ private:
         MONGO_MAKE_LATCH("ReshardingCoordinatorService::_fulfillmentMutex");
 
     /**
+     * Must be locked while the _abortCalled is being set to true.
+     */
+    mutable Mutex _abortCalledMutex =
+        MONGO_MAKE_LATCH("ReshardingCoordinatorService::_abortCalledMutex");
+
+
+    /**
      * Coordinator does not enter the critical section until this is fulfilled.
      * Can be set by "commitReshardCollection" command or by metrics determining
      * that it's okay to proceed.
@@ -553,6 +562,10 @@ private:
     std::shared_ptr<resharding::CoordinatorCommitMonitor> _commitMonitor;
 
     std::shared_ptr<ReshardingCoordinatorExternalState> _reshardingCoordinatorExternalState;
+
+    // Used to catch the case when an abort() is called but the cancellation source (_ctHolder) has
+    // not been initialized.
+    bool _abortCalled{false};
 };
 
 }  // namespace mongo

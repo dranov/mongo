@@ -133,7 +133,9 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual void printRecordMetadata(OperationContext* opCtx, const RecordId& recordId) const {
+    virtual void printRecordMetadata(OperationContext* opCtx,
+                                     const RecordId& recordId,
+                                     std::set<Timestamp>* recordTimestamps) const {
         MONGO_UNREACHABLE;
     }
 
@@ -235,6 +237,9 @@ public:
     virtual bool isEmpty(OperationContext* opCtx) {
         return true;
     }
+
+    virtual void printIndexEntryMetadata(OperationContext* opCtx,
+                                         const KeyString::Value& keyString) const {}
 
     virtual std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx,
                                                                    bool isForward) const {

@@ -187,11 +187,16 @@ __wt_stats_clear(void *stats_arg, int slot)
         WT_STAT_INCRV_ATOMIC_BASE(session, (stats)[(session)->stat_bucket], fld, value); \
     } while (0)
 #define WT_STAT_INCR(session, stats, fld) WT_STAT_INCRV(session, stats, fld, 1)
+#define WT_STAT_SET_BASE(session, stat, fld, value) \
+    do {                                            \
+        if (WT_STAT_ENABLED(session))               \
+            (stat)->fld = (int64_t)(value);         \
+    } while (0)
 #define WT_STAT_SET(session, stats, fld, value)                            \
     do {                                                                   \
         if (WT_STAT_ENABLED(session)) {                                    \
             __wt_stats_clear(stats, WT_STATS_FIELD_TO_OFFSET(stats, fld)); \
-            (stats)[0]->fld = (int64_t)(value);                            \
+            WT_STAT_SET_BASE(session, (stats)[0], fld, value);             \
         }                                                                  \
     } while (0)
 
@@ -260,6 +265,8 @@ __wt_stats_clear(void *stats_arg, int slot)
  */
 #define WT_STAT_SESSION_INCRV(session, fld, value) \
     WT_STAT_INCRV_BASE(session, &(session)->stats, fld, value)
+#define WT_STAT_SESSION_SET(session, fld, value) \
+    WT_STAT_SET_BASE(session, &(session)->stats, fld, value)
 
 /*
  * Construct histogram increment functions to put the passed value into the right bucket. Bucket
@@ -342,6 +349,8 @@ struct __wt_connection_stats {
     int64_t lsm_work_units_done;
     int64_t lsm_work_units_created;
     int64_t lsm_work_queue_max;
+    int64_t autocommit_readonly_retry;
+    int64_t autocommit_update_retry;
     int64_t block_cache_blocks_update;
     int64_t block_cache_bytes_update;
     int64_t block_cache_blocks_evicted;
@@ -400,6 +409,7 @@ struct __wt_connection_stats {
     int64_t cache_eviction_blocked_ooo_checkpoint_race_2;
     int64_t cache_eviction_blocked_ooo_checkpoint_race_3;
     int64_t cache_eviction_blocked_ooo_checkpoint_race_4;
+    int64_t cache_eviction_blocked_remove_hs_race_with_checkpoint;
     int64_t cache_eviction_walk_passes;
     int64_t cache_eviction_queue_empty;
     int64_t cache_eviction_queue_not_empty;
@@ -475,6 +485,7 @@ struct __wt_connection_stats {
     int64_t cache_eviction_split_leaf;
     int64_t cache_bytes_max;
     int64_t cache_eviction_maximum_page_size;
+    int64_t cache_eviction_maximum_seconds;
     int64_t cache_eviction_dirty;
     int64_t cache_eviction_app_dirty;
     int64_t cache_timed_out_ops;
@@ -695,6 +706,8 @@ struct __wt_connection_stats {
     int64_t rec_page_delete_fast;
     int64_t rec_overflow_key_leaf;
     int64_t rec_maximum_seconds;
+    int64_t rec_maximum_image_build_seconds;
+    int64_t rec_maximum_hs_wrapup_seconds;
     int64_t rec_pages;
     int64_t rec_pages_eviction;
     int64_t rec_pages_with_prepare;
@@ -781,8 +794,6 @@ struct __wt_connection_stats {
     int64_t txn_prepare_commit;
     int64_t txn_prepare_active;
     int64_t txn_prepare_rollback;
-    int64_t txn_prepare_rollback_do_not_remove_hs_update;
-    int64_t txn_prepare_rollback_fix_hs_update_with_ckpt_reserved_txnid;
     int64_t txn_query_ts;
     int64_t txn_read_race_prepare_update;
     int64_t txn_rts;
@@ -867,6 +878,8 @@ struct __wt_dsrc_stats {
     int64_t lsm_checkpoint_throttle;
     int64_t lsm_merge_throttle;
     int64_t bloom_size;
+    int64_t autocommit_readonly_retry;
+    int64_t autocommit_update_retry;
     int64_t block_extension;
     int64_t block_alloc;
     int64_t block_free;
@@ -911,6 +924,7 @@ struct __wt_dsrc_stats {
     int64_t cache_eviction_blocked_ooo_checkpoint_race_2;
     int64_t cache_eviction_blocked_ooo_checkpoint_race_3;
     int64_t cache_eviction_blocked_ooo_checkpoint_race_4;
+    int64_t cache_eviction_blocked_remove_hs_race_with_checkpoint;
     int64_t cache_eviction_walk_passes;
     int64_t cache_eviction_target_page_lt10;
     int64_t cache_eviction_target_page_lt32;
@@ -1107,6 +1121,7 @@ struct __wt_session_stats {
     int64_t bytes_read;
     int64_t bytes_write;
     int64_t lock_dhandle_wait;
+    int64_t txn_bytes_dirty;
     int64_t read_time;
     int64_t write_time;
     int64_t lock_schema_wait;

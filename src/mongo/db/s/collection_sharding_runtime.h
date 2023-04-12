@@ -113,18 +113,25 @@ public:
      * Marks the collection's filtering metadata as UNKNOWN, meaning that all attempts to check for
      * shard version match will fail with StaleConfig errors in order to trigger an update.
      *
+     * Interrupts any ongoing shard metadata refresh.
+     *
      * It is safe to call this method with only an intent lock on the collection (as opposed to
-     * setFilteringMetadata which requires exclusive), however note that clearing a collection's
-     * filtering metadata will interrupt all in-progress orphan cleanups in which case orphaned data
-     * will remain behind on disk.
+     * setFilteringMetadata which requires exclusive).
      */
     void clearFilteringMetadata(OperationContext* opCtx);
+
+    /**
+     * Calls to clearFilteringMetadata + clears the _metadataManager object.
+     */
+    void clearFilteringMetadataForDroppedCollection(OperationContext* opCtx);
 
     /**
      * Methods to control the collection's critical section. Methods listed below must be called
      * with both the collection lock and CSRLock held in exclusive mode.
      *
      * In these methods, the CSRLock ensures concurrent access to the critical section.
+     *
+     * Entering into the Critical Section interrupts any ongoing filtering metadata refresh.
      */
     void enterCriticalSectionCatchUpPhase(const CSRLock&, const BSONObj& reason);
     void enterCriticalSectionCommitPhase(const CSRLock&, const BSONObj& reason);
@@ -248,6 +255,11 @@ private:
         const boost::optional<mongo::LogicalTime>& atClusterTime,
         bool supportNonVersionedOperations = false);
 
+    /**
+     * Auxiliary function used to implement the different flavours of clearFilteringMetadata.
+     */
+    void _clearFilteringMetadata(OperationContext* opCtx, bool clearFilteringMetadata);
+
     // The service context under which this instance runs
     ServiceContext* const _serviceContext;
 
@@ -273,10 +285,26 @@ private:
     // Tracks whether the filtering metadata is unknown, unsharded, or sharded
     enum class MetadataType { kUnknown, kUnsharded, kSharded } _metadataType;
 
-    // If the collection is sharded, contains all the metadata associated with this collection.
+    // If the collection state is known and is unsharded, this will be nullptr.
     //
-    // If the collection is unsharded, the metadata has not been set yet, or the metadata has been
-    // specifically reset by calling clearFilteringMetadata(), this will be nullptr;
+    // If the collection state is known and is sharded, this will point to the metadata associated
+    // with this collection.
+    //
+    // If the collection state is unknown:
+    // - If the metadata had never been set yet, this will be nullptr.
+    // - If the collection state was known and was sharded, this contains the metadata that
+    // were known for the collection before the last invocation of clearFilteringMetadata().
+    //
+    // The following matrix enumerates the valid (Y) and invalid (X) scenarios.
+    //                          _________________________________
+    //                         | _metadataType (collection state)|
+    //                         |_________________________________|
+    //                         | UNKNOWN | UNSHARDED |  SHARDED  |
+    //  _______________________|_________|___________|___________|
+    // |_metadataManager unset |    Y    |     Y     |     X     |
+    // |_______________________|_________|___________|___________|
+    // |_metadataManager set   |    Y    |     X     |     Y     |
+    // |_______________________|_________|___________|___________|
     std::shared_ptr<MetadataManager> _metadataManager;
 
     // Used for testing to check the number of times a new MetadataManager has been installed.

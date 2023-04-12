@@ -831,6 +831,9 @@ __txn_checkpoint(WT_SESSION_IMPL *session, const char *cfg[])
 
     /* Reset the statistics tracked per checkpoint. */
     cache->evict_max_page_size = 0;
+    cache->evict_max_seconds = 0;
+    conn->rec_maximum_hs_wrapup_seconds = 0;
+    conn->rec_maximum_image_build_seconds = 0;
     conn->rec_maximum_seconds = 0;
 
     /* Initialize the verbose tracking timer */
@@ -1362,6 +1365,15 @@ __checkpoint_lock_dirty_tree_int(WT_SESSION_IMPL *session, bool is_checkpoint, b
             continue;
         is_wt_ckpt = WT_PREFIX_MATCH(ckpt->name, WT_CHECKPOINT);
 
+        /*
+         * If we are restarting from a backup and we're in recovery do not delete any checkpoints.
+         * In the event of a crash we may need to restart from the backup and all checkpoints that
+         * were in the backup file must remain.
+         */
+        if (F_ISSET(conn, WT_CONN_RECOVERING) && F_ISSET(conn, WT_CONN_WAS_BACKUP)) {
+            F_CLR(ckpt, WT_CKPT_DELETE);
+            continue;
+        }
         /*
          * If there is a hot backup, don't delete any WiredTiger checkpoint that could possibly have
          * been created before the backup started. Fail if trying to delete any other named

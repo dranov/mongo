@@ -62,8 +62,9 @@
 #include "mongo/db/client.h"
 #include "mongo/db/coll_mod_gen.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/create_gen.h"
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
@@ -288,23 +289,6 @@ void writeToImageCollection(OperationContext* opCtx,
 
     DisableDocumentValidation documentValidationDisabler(
         opCtx, DocumentValidationSettings::kDisableInternalValidation);
-
-    BSONObj existingImageEntryBson;
-    Helpers::findOne(opCtx,
-                     autoColl.getCollection(),
-                     BSON("_id" << imageEntry.get_id().toBSON() << "ts" << imageEntry.getTs()),
-                     existingImageEntryBson);
-    if (!existingImageEntryBson.isEmpty()) {
-        auto existingImageEntry = repl::ImageEntry::parse(
-            IDLParserErrorContext("writeToImageCollection"), existingImageEntryBson);
-        uassert(
-            6652600,
-            str::stream()
-                << "Found an existing findAndModify image entry with unexpected content. Found: "
-                << existingImageEntry.toBSON() << ". Expected: " << imageEntry.toBSON(),
-            existingImageEntry.toBSON().woCompare(imageEntry.toBSON()) == 0);
-        return;
-    }
 
     UpdateRequest request;
     request.setNamespaceString(NamespaceString::kConfigImagesNamespace);
@@ -806,6 +790,26 @@ NamespaceString extractNsFromUUIDorNs(OperationContext* opCtx,
     return ui ? extractNsFromUUID(opCtx, ui.get()) : extractNs(ns.db(), cmd);
 }
 
+StatusWith<BSONObj> getObjWithSanitizedStorageEngineOptions(OperationContext* opCtx,
+                                                            const BSONObj& cmd) {
+    static_assert(
+        CreateCommand::kStorageEngineFieldName == IndexDescriptor::kStorageEngineFieldName,
+        "Expected storage engine options field to be the same for collections and indexes.");
+
+    if (auto storageEngineElem = cmd[IndexDescriptor::kStorageEngineFieldName]) {
+        auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+        auto engineObj = storageEngineElem.embeddedObject();
+        auto sanitizedObj =
+            storageEngine->getSanitizedStorageOptionsForSecondaryReplication(engineObj);
+        if (!sanitizedObj.isOK()) {
+            return sanitizedObj.getStatus();
+        }
+        return cmd.addFields(
+            BSON(IndexDescriptor::kStorageEngineFieldName << sanitizedObj.getValue()));
+    }
+    return cmd;
+}
+
 using OpApplyFn = std::function<Status(
     OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode)>;
 
@@ -830,7 +834,14 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
     {"create",
      {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           const auto& ui = entry.getUuid();
-          const auto& cmd = entry.getObject();
+          // Sanitize storage engine options to remove options which might not apply to this node.
+          // See SERVER-68122.
+          const auto sanitizedCmdOrStatus =
+              getObjWithSanitizedStorageEngineOptions(opCtx, entry.getObject());
+          if (!sanitizedCmdOrStatus.isOK()) {
+              return sanitizedCmdOrStatus.getStatus();
+          }
+          const auto& cmd = sanitizedCmdOrStatus.getValue();
           const NamespaceString nss(extractNs(entry.getNss().db(), cmd));
 
           // Mode SECONDARY steady state replication should not allow create collection to rename an
@@ -874,7 +885,15 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
       {ErrorCodes::NamespaceExists}}},
     {"createIndexes",
      {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
-          const auto& cmd = entry.getObject();
+          // Sanitize storage engine options to remove options which might not apply to this node.
+          // See SERVER-68122.
+          const auto sanitizedCmdOrStatus =
+              getObjWithSanitizedStorageEngineOptions(opCtx, entry.getObject());
+          if (!sanitizedCmdOrStatus.isOK()) {
+              return sanitizedCmdOrStatus.getStatus();
+          }
+          const auto& cmd = sanitizedCmdOrStatus.getValue();
+
           if (OplogApplication::Mode::kApplyOpsCmd == mode) {
               return {ErrorCodes::CommandNotSupported,
                       "The createIndexes operation is not supported in applyOps mode"};
@@ -907,6 +926,16 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
           if (!swOplogEntry.isOK()) {
               return swOplogEntry.getStatus().withContext(
                   "Error parsing 'startIndexBuild' oplog entry");
+          }
+
+          // Sanitize storage engine options to remove options which might not apply to this node.
+          // See SERVER-68122.
+          for (auto& spec : swOplogEntry.getValue().indexSpecs) {
+              auto sanitizedObj = getObjWithSanitizedStorageEngineOptions(opCtx, spec);
+              if (!sanitizedObj.isOK()) {
+                  return swOplogEntry.getStatus();
+              }
+              spec = sanitizedObj.getValue();
           }
 
           IndexBuildsCoordinator::ApplicationMode applicationMode =

@@ -98,14 +98,11 @@ void _validateIndexesInternalStructure(OperationContext* opCtx,
 
         auto& curIndexResults = (results->indexResultsMap)[descriptor->indexName()];
 
-        int64_t numValidated;
-        iam->validate(opCtx, &numValidated, &curIndexResults);
+        iam->validate(opCtx, nullptr, &curIndexResults);
 
         if (!curIndexResults.valid) {
             results->valid = false;
         }
-
-        curIndexResults.keysTraversedFromFullValidate = numValidated;
     }
 }
 
@@ -136,33 +133,6 @@ void _validateIndexes(OperationContext* opCtx,
 
         auto& curIndexResults = (results->indexResultsMap)[descriptor->indexName()];
         curIndexResults.keysTraversed = numTraversedKeys;
-
-        // If we are performing a full index validation, we have information on the number of index
-        // keys validated in _validateIndexesInternalStructure (when we validated the internal
-        // structure of the index). Check if this is consistent with 'numTraversedKeys' from
-        // traverseIndex above.
-        if (validateState->isFullIndexValidation()) {
-            invariant(opCtx->lockState()->isCollectionLockedForMode(validateState->nss(), MODE_X));
-
-            // The number of keys counted in _validateIndexesInternalStructure, when checking the
-            // internal structure of the index.
-            const int64_t numIndexKeys = curIndexResults.keysTraversedFromFullValidate;
-
-            // Check if currIndexResults is valid to ensure that this index is not corrupted or
-            // comprised (which was set in _validateIndexesInternalStructure). If the index is
-            // corrupted, there is no use in checking if the traversal yielded the same key count.
-            if (curIndexResults.valid) {
-                if (numIndexKeys != numTraversedKeys) {
-                    curIndexResults.valid = false;
-                    string msg = str::stream()
-                        << "number of traversed index entries (" << numTraversedKeys
-                        << ") does not match the number of expected index entries (" << numIndexKeys
-                        << ")";
-                    results->errors.push_back(msg);
-                    results->valid = false;
-                }
-            }
-        }
 
         if (!curIndexResults.valid) {
             results->valid = false;
@@ -230,7 +200,7 @@ void _gatherIndexEntryErrors(OperationContext* opCtx,
 
     LOGV2_OPTIONS(20301, {LogComponent::kIndex}, "Finished traversing through all the indexes");
 
-    indexConsistency->addIndexEntryErrors(result);
+    indexConsistency->addIndexEntryErrors(opCtx, result);
 }
 
 void _validateIndexKeyCount(OperationContext* opCtx,
@@ -244,6 +214,81 @@ void _validateIndexKeyCount(OperationContext* opCtx,
         if (curIndexResults.valid) {
             indexValidator->validateIndexKeyCount(opCtx, index.get(), curIndexResults);
         }
+    }
+}
+
+void _printIndexSpec(const ValidateState* validateState, StringData indexName) {
+    auto& indexes = validateState->getIndexes();
+    auto indexEntry =
+        std::find_if(indexes.begin(),
+                     indexes.end(),
+                     [&](const std::shared_ptr<const IndexCatalogEntry> indexEntry) -> bool {
+                         return indexEntry->descriptor()->indexName() == indexName;
+                     });
+    if (indexEntry != indexes.end()) {
+        auto indexSpec = (*indexEntry)->descriptor()->infoObj();
+        LOGV2_ERROR(7463100, "Index failed validation", "spec"_attr = indexSpec);
+    }
+}
+
+/**
+ * Logs oplog entries related to corrupted records/indexes in validation results.
+ */
+void _logOplogEntriesForInvalidResults(OperationContext* opCtx, ValidateResults* results) {
+    if (results->recordTimestamps.empty()) {
+        return;
+    }
+
+    LOGV2(
+        7464200,
+        "Validation failed: oplog timestamps referenced by corrupted collection and index entries",
+        "numTimestamps"_attr = results->recordTimestamps.size());
+
+    // Set up read on oplog collection.
+    try {
+        AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+        const auto& oplogCollection = oplogRead.getCollection();
+
+        // Log oplog entries in reverse from most recent timestamp to oldest.
+        // Due to oplog truncation, if we fail to find any oplog entry for a particular timestamp,
+        // we can stop searching for oplog entries with earlier timestamps.
+        auto recordStore = oplogCollection->getRecordStore();
+        uassert(ErrorCodes::InternalError,
+                "Validation failed: Unable to get oplog record store for corrupted collection and "
+                "index entries",
+                recordStore);
+
+        auto cursor = recordStore->getCursor(opCtx, /*forward=*/false);
+        uassert(ErrorCodes::CursorNotFound,
+                "Validation failed: Unable to get cursor to oplog collection.",
+                cursor);
+
+        for (auto it = results->recordTimestamps.rbegin(); it != results->recordTimestamps.rend();
+             it++) {
+            const auto& timestamp = *it;
+
+            // A record id in the oplog collection is equivalent to the document's timestamp field.
+            RecordId recordId(timestamp.asULL());
+            auto record = cursor->seekExact(recordId);
+            if (!record) {
+                LOGV2(7464201,
+                      "    Validation failed: Stopping oplog entry search for corrupted collection "
+                      "and index entries.",
+                      "timestamp"_attr = timestamp);
+                break;
+            }
+
+            LOGV2(
+                7464202,
+                "    Validation failed: Oplog entry found for corrupted collection and index entry",
+                "timestamp"_attr = timestamp,
+                "oplogEntryDoc"_attr = redact(record->data.toBson()));
+        }
+    } catch (DBException& ex) {
+        LOGV2_ERROR(7464203,
+                    "Validation failed: Unable to fetch entries from oplog collection for "
+                    "corrupted collection and index entries",
+                    "ex"_attr = ex);
     }
 }
 
@@ -263,17 +308,19 @@ void _reportValidationResults(OperationContext* opCtx,
 
     // Report detailed index validation results gathered when using {full: true} for validated
     // indexes.
-    for (const auto& index : validateState->getIndexes()) {
-        const std::string indexName = index->descriptor()->indexName();
-        auto& indexResultsMap = results->indexResultsMap;
-        if (indexResultsMap.find(indexName) == indexResultsMap.end()) {
-            continue;
-        }
-
-        auto& vr = indexResultsMap.at(indexName);
-
+    int nIndexes = results->indexResultsMap.size();
+    for (const auto& [indexName, vr] : results->indexResultsMap) {
         if (!vr.valid) {
             results->valid = false;
+            _printIndexSpec(validateState, indexName);
+        }
+
+        if (validateState->getSkippedIndexes().contains(indexName)) {
+            // Index internal state was checked and cleared, so it was reported in indexResultsMap,
+            // but we did not verify the index contents against the collection, so we should exclude
+            // it from this report.
+            --nIndexes;
+            continue;
         }
 
         BSONObjBuilder bob(indexDetails.subobjStart(indexName));
@@ -294,7 +341,7 @@ void _reportValidationResults(OperationContext* opCtx,
         results->errors.insert(results->errors.end(), vr.errors.begin(), vr.errors.end());
     }
 
-    output->append("nIndexes", static_cast<int>(validateState->getIndexes().size()));
+    output->append("nIndexes", nIndexes);
     output->append("keysPerIndex", keysPerIndex.done());
     output->append("indexDetails", indexDetails.done());
 }
@@ -304,6 +351,7 @@ void _reportInvalidResults(OperationContext* opCtx,
                            ValidateResults* results,
                            BSONObjBuilder* output) {
     _reportValidationResults(opCtx, validateState, results, output);
+    _logOplogEntriesForInvalidResults(opCtx, results);
     LOGV2_OPTIONS(20302,
                   {LogComponent::kIndex},
                   "Validation complete -- Corruption found",
@@ -561,12 +609,12 @@ Status validate(OperationContext* opCtx,
                 RepairMode repairMode,
                 ValidateResults* results,
                 BSONObjBuilder* output,
-                bool turnOnExtraLoggingForTest) {
+                bool logDiagnostics) {
     invariant(!opCtx->lockState()->isLocked() || storageGlobalParams.repair);
 
     // This is deliberately outside of the try-catch block, so that any errors thrown in the
     // constructor fail the cmd, as opposed to returning OK with valid:false.
-    ValidateState validateState(opCtx, nss, mode, repairMode, turnOnExtraLoggingForTest);
+    ValidateState validateState(opCtx, nss, mode, repairMode, logDiagnostics);
 
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     // Check whether we are allowed to read from this node after acquiring our locks. If we are

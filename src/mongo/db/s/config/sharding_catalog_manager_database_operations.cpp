@@ -37,6 +37,7 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/server_options.h"
@@ -93,9 +94,14 @@ DatabaseType ShardingCatalogManager::createDatabase(OperationContext* opCtx,
             dbName.toString(), ShardId::kConfigServerId, DatabaseVersion::makeFixed());
     }
 
+    // It is not allowed to create the 'admin' or 'local' databases, including any alternative
+    // casing. It is allowed to create the 'config' database (handled by the early return above),
+    // but only with that exact casing.
     uassert(ErrorCodes::InvalidOptions,
-            str::stream() << "Cannot manually create database'" << dbName << "'",
-            dbName != NamespaceString::kAdminDb && dbName != NamespaceString::kLocalDb);
+            str::stream() << "Cannot manually create database '" << dbName << "'",
+            !dbName.equalCaseInsensitive(NamespaceString::kAdminDb) &&
+                !dbName.equalCaseInsensitive(NamespaceString::kLocalDb) &&
+                !dbName.equalCaseInsensitive(NamespaceString::kConfigDb));
 
     uassert(ErrorCodes::InvalidNamespace,
             str::stream() << "Invalid db name specified: " << dbName,
@@ -162,7 +168,7 @@ DatabaseType ShardingCatalogManager::createDatabase(OperationContext* opCtx,
         // Do another loop, with the db lock held in order to avoid taking the expensive path on
         // concurrent create database operations
         dbLock.emplace(DistLockManager::get(opCtx)->lockDirectLocally(
-            opCtx, dbName, DistLockManager::kDefaultLockTimeout));
+            opCtx, str::toLower(dbName), DistLockManager::kDefaultLockTimeout));
     }
 
     // Expensive createDatabase code path
@@ -266,6 +272,65 @@ DatabaseType ShardingCatalogManager::createDatabase(OperationContext* opCtx,
     uassertStatusOK(cmdResponse.commandStatus);
 
     return database;
+}
+
+void ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
+                                               const StringData& dbName,
+                                               const DatabaseVersion& expectedDbVersion,
+                                               const ShardId& toShardId) {
+    // Hold the shard lock until the entire commit finishes to serialize with removeShard.
+    Lock::SharedLock shardLock(opCtx->lockState(), _kShardMembershipLock);
+
+    const auto toShardDoc = [&] {
+        DBDirectClient dbClient(opCtx);
+        return dbClient.findOne(NamespaceString::kConfigsvrShardsNamespace,
+                                BSON(ShardType::name << toShardId));
+    }();
+    uassert(ErrorCodes::ShardNotFound,
+            "Requested primary shard {} does not exist"_format(toShardId.toString()),
+            !toShardDoc.isEmpty());
+
+    const auto toShardEntry = uassertStatusOK(ShardType::fromBSON(toShardDoc));
+    uassert(ErrorCodes::ShardNotFound,
+            "Requested primary shard {} is draining"_format(toShardId.toString()),
+            !toShardEntry.getDraining());
+
+    const auto updateOp = [&] {
+        const auto query = [&] {
+            BSONObjBuilder bsonBuilder;
+            bsonBuilder.append(DatabaseType::kNameFieldName, dbName);
+            // Include the version in the update filter to be resilient to potential network retries
+            // and delayed messages.
+            for (const auto [fieldName, fieldValue] : expectedDbVersion.toBSON()) {
+                const auto dottedFieldName = DatabaseType::kVersionFieldName + "." + fieldName;
+                bsonBuilder.appendAs(fieldValue, dottedFieldName);
+            }
+            return bsonBuilder.obj();
+        }();
+
+        const auto update = [&] {
+            const auto newDbVersion = expectedDbVersion.makeUpdated();
+
+            BSONObjBuilder bsonBuilder;
+            bsonBuilder.append(DatabaseType::kPrimaryFieldName, toShardId);
+            bsonBuilder.append(DatabaseType::kVersionFieldName, newDbVersion.toBSON());
+            return BSON("$set" << bsonBuilder.obj());
+        }();
+
+        write_ops::UpdateCommandRequest updateOp(NamespaceString::kConfigDatabasesNamespace);
+        updateOp.setUpdates({[&] {
+            write_ops::UpdateOpEntry entry;
+            entry.setQ(query);
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
+            return entry;
+        }()});
+
+        return updateOp;
+    }();
+
+    DBDirectClient dbClient(opCtx);
+    const auto commandResponse = dbClient.runCommand(updateOp.serialize({}));
+    uassertStatusOK(getStatusFromWriteCommandReply(commandResponse->getCommandReply()));
 }
 
 }  // namespace mongo

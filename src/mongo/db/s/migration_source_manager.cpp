@@ -33,7 +33,6 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/op_observer.h"
@@ -479,7 +478,7 @@ void MigrationSourceManager::enterCriticalSection() {
     // NOTE: The 'migrateChunkToNewShard' oplog message written by the above call to
     // 'notifyChangeStreamsOnRecipientFirstChunk' depends on this majority write to carry its
     // local write to majority committed.
-    uassertStatusOK(ShardingStateRecovery::startMetadataOp(_opCtx));
+    uassertStatusOKWithContext(ShardingStateRecovery::startMetadataOp(_opCtx), "Start metadata op");
 
     LOGV2_DEBUG_OPTIONS(4817402,
                         2,
@@ -497,17 +496,13 @@ void MigrationSourceManager::enterCriticalSection() {
     // time inclusive of the migration config commit update from accessing secondary data.
     // Note: this write must occur after the critSec flag is set, to ensure the secondary refresh
     // will stall behind the flag.
-    Status signalStatus = shardmetadatautil::updateShardCollectionsEntry(
-        _opCtx,
-        BSON(ShardCollectionType::kNssFieldName << nss().ns()),
-        BSON("$inc" << BSON(ShardCollectionType::kEnterCriticalSectionCounterFieldName << 1)),
-        false /*upsert*/);
-    if (!signalStatus.isOK()) {
-        uasserted(
-            ErrorCodes::OperationFailed,
-            str::stream() << "Failed to persist critical section signal for secondaries due to: "
-                          << signalStatus.toString());
-    }
+    uassertStatusOKWithContext(
+        shardmetadatautil::updateShardCollectionsEntry(
+            _opCtx,
+            BSON(ShardCollectionType::kNssFieldName << nss().ns()),
+            BSON("$inc" << BSON(ShardCollectionType::kEnterCriticalSectionCounterFieldName << 1)),
+            false /*upsert*/),
+        "Persist critical section signal for secondaries");
 
     LOGV2(22017,
           "Migration successfully entered critical section",
@@ -684,7 +679,7 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
 
     _stats.totalCriticalSectionCommitTimeMillis.addAndFetch(t.millis());
 
-    LOGV2(4817403,
+    LOGV2(6107801,
           "Exiting commit critical section",
           "migrationId"_attr = _coordinator->getMigrationId(),
           "durationMillis"_attr = t.millis());
@@ -805,6 +800,12 @@ void MigrationSourceManager::_cleanup(bool completeMigration) noexcept {
     }();
 
     if (_state == kCriticalSection || _state == kCloneCompleted || _state == kCommittingOnConfig) {
+        LOGV2_DEBUG_OPTIONS(4817403,
+                            2,
+                            {logv2::LogComponent::kShardMigrationPerf},
+                            "Finished critical section",
+                            "migrationId"_attr = _coordinator->getMigrationId());
+
         LOGV2(6107802,
               "Finished critical section",
               "migrationId"_attr = _coordinator->getMigrationId(),

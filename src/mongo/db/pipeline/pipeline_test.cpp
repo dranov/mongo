@@ -75,6 +75,7 @@ using std::string;
 using std::vector;
 
 const NamespaceString kTestNss = NamespaceString("a.collection");
+const NamespaceString kAdminCollectionlessNss = NamespaceString("admin.$cmd.aggregate");
 
 constexpr size_t getChangeStreamStageSize() {
     return 6;
@@ -114,7 +115,8 @@ class StubExplainInterface : public StubMongoProcessInterface {
 };
 void assertPipelineOptimizesAndSerializesTo(std::string inputPipeJson,
                                             std::string outputPipeJson,
-                                            std::string serializedPipeJson) {
+                                            std::string serializedPipeJson,
+                                            NamespaceString aggNss = kTestNss) {
     QueryTestServiceContext testServiceContext;
     auto opCtx = testServiceContext.makeOperationContext();
 
@@ -128,7 +130,7 @@ void assertPipelineOptimizesAndSerializesTo(std::string inputPipeJson,
         ASSERT_EQUALS(stageElem.type(), BSONType::Object);
         rawPipeline.push_back(stageElem.embeddedObject());
     }
-    AggregateCommandRequest request(kTestNss, rawPipeline);
+    AggregateCommandRequest request(aggNss, rawPipeline);
     intrusive_ptr<ExpressionContextForTest> ctx =
         new ExpressionContextForTest(opCtx.get(), request);
     ctx->mongoProcessInterface = std::make_shared<StubExplainInterface>();
@@ -2981,6 +2983,71 @@ TEST(PipelineOptimizationTest, MatchGetsPushedIntoBothChildrenOfUnion) {
         "]");
 }
 
+TEST(PipelineOptimizationTest, internalAllCollectionStatsAbsorbsMatchOnNs) {
+    std::string inputPipe =
+        "["
+        " {$_internalAllCollectionStats: {}},"
+        " {$match: {ns: 'test.foo', a: 10}}"
+        "]";
+    std::string outputPipe =
+        "["
+        " {$_internalAllCollectionStats: {match: {ns: {$eq: 'test.foo'}}}},"
+        " {$match: {a: {$eq: 10}}}"
+        "]";
+    std::string serializedPipe =
+        "["
+        " {$_internalAllCollectionStats: {}},"
+        " {$match: {ns: {$eq: 'test.foo'}}},"
+        " {$match: {a: {$eq: 10}}}"
+        "]";
+    assertPipelineOptimizesAndSerializesTo(
+        inputPipe, outputPipe, serializedPipe, kAdminCollectionlessNss);
+}
+
+TEST(PipelineOptimizationTest, internalAllCollectionStatsAbsorbsSeveralMatchesOnNs) {
+    std::string inputPipe =
+        "["
+        " {$_internalAllCollectionStats: {}},"
+        " {$match: {ns: {$gt: 0}}},"
+        " {$match: {a: 10}},"
+        " {$match: {ns: {$ne: 5}}}"
+        "]";
+    std::string outputPipe =
+        "["
+        " {$_internalAllCollectionStats: {match: {$and: [{ns: {$gt: 0}}, {ns: {$not: {$eq: "
+        "5}}}]}}},"
+        " {$match: {a: {$eq: 10}}}"
+        "]";
+    std::string serializedPipe =
+        "["
+        " {$_internalAllCollectionStats: {}},"
+        " {$match: {$and: [{ns: {$gt: 0}}, {ns: {$not: {$eq: 5}}}]}},"
+        " {$match: {a: {$eq: 10}}}"
+        "]";
+    assertPipelineOptimizesAndSerializesTo(
+        inputPipe, outputPipe, serializedPipe, kAdminCollectionlessNss);
+}
+
+TEST(PipelineOptimizationTest, internalAllCollectionStatsDoesNotAbsorbMatchNotOnNs) {
+    std::string inputPipe =
+        "["
+        " {$_internalAllCollectionStats: {}},"
+        " {$match: {a: 10}}"
+        "]";
+    std::string outputPipe =
+        "["
+        " {$_internalAllCollectionStats: {}},"
+        " {$match: {a: {$eq: 10}}}"
+        "]";
+    std::string serializedPipe =
+        "["
+        " {$_internalAllCollectionStats: {}},"
+        " {$match: {a: 10}}"
+        "]";
+    assertPipelineOptimizesAndSerializesTo(
+        inputPipe, outputPipe, serializedPipe, kAdminCollectionlessNss);
+}
+
 TEST(PipelineOptimizationTest, ProjectGetsPushedIntoBothChildrenOfUnion) {
     assertPipelineOptimizesTo(
         "["
@@ -4599,7 +4666,7 @@ public:
      * Returns a description which communicate that this stage modifies nothing.
      */
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>(), {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet(), {}};
     }
 };
 
@@ -4676,7 +4743,7 @@ public:
      * Returns a description which communicate that this stage modifies nothing.
      */
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kNotSupported, std::set<std::string>(), {}};
+        return {GetModPathsReturn::Type::kNotSupported, OrderedPathSet(), {}};
     }
 };
 
@@ -4712,7 +4779,7 @@ public:
         return new RenamesAToB(expCtx);
     }
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"b", "a"}}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {{"b", "a"}}};
     }
 };
 
@@ -4836,7 +4903,7 @@ public:
         return new RenamesBToC(expCtx);
     }
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"c", "b"}}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {{"c", "b"}}};
     }
 };
 
@@ -4879,7 +4946,7 @@ public:
         return new RenamesBToA(expCtx);
     }
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"a", "b"}}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {{"a", "b"}}};
     }
 };
 

@@ -196,7 +196,9 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::top
         << ActionType::useUUID
         << ActionType::inprog
-        << ActionType::shardingState;
+        << ActionType::shardingState
+        << ActionType::allCollectionStats
+        << ActionType::shardedDataDistribution;
 
     // clusterMonitor role actions that target a database (or collection) resource
     clusterMonitorRoleDatabaseActions
@@ -420,6 +422,11 @@ void addClusterMonitorPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
         Privilege(ResourcePattern::forDatabaseName("config"), clusterMonitorRoleDatabaseActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forExactNamespace(NamespaceString("config", "system.sessions")),
+                  clusterMonitorRoleDatabaseActions));
+
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
         Privilege(ResourcePattern::forDatabaseName("local"), clusterMonitorRoleDatabaseActions));
@@ -687,6 +694,8 @@ void addRestorePrivileges(PrivilegeVector* privileges) {
                       // Need to be able to set and bypass write blocking mode for C2C replication
                       ActionType::bypassWriteBlockingMode,
                       ActionType::setUserWriteBlockMode,
+                      // Needed for `mongorestore --preserveUUID`
+                      ActionType::applyOps,
                   }));
 }
 

@@ -36,7 +36,7 @@
 #include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/ops/delete.h"
@@ -56,6 +56,7 @@
 #include "mongo/db/s/resharding/resharding_recipient_service_external_state.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/shard_key_util.h"
+#include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/write_block_bypass.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -145,6 +146,8 @@ ReshardingRecipientService::RecipientStateMachine::RecipientStateMachine(
       _recipientCtx{recipientDoc.getMutableState()},
       _donorShards{recipientDoc.getDonorShards()},
       _cloneTimestamp{recipientDoc.getCloneTimestamp()},
+      _timeIntervals{recipientDoc.getMetrics().get_value_or({})},
+      _approxBytesToCopy{recipientDoc.getApproxBytesToCopy()},
       _externalState{std::move(externalState)},
       _startConfigTxnCloneAt{recipientDoc.getStartConfigTxnCloneTime()},
       _markKilledExecutor(std::make_shared<ThreadPool>([] {
@@ -166,6 +169,7 @@ ReshardingRecipientService::RecipientStateMachine::RecipientStateMachine(
                                   return donor.getShardId() == myShardId;
                               }) != _donorShards.end();
       }()) {
+
     invariant(_externalState);
 }
 
@@ -553,6 +557,11 @@ ReshardingRecipientService::RecipientStateMachine::_makeDataReplication(Operatio
                                                                         bool cloningDone) {
     invariant(_cloneTimestamp);
 
+    // We refresh the routing information for the source collection to ensure the
+    // ReshardingOplogApplier is making its decisions according to the chunk distribution after the
+    // sharding metadata was frozen.
+    _externalState->refreshCatalogCache(opCtx, _metadata.getSourceNss());
+
     auto myShardId = _externalState->myShardId(opCtx->getServiceContext());
     auto sourceChunkMgr =
         _externalState->getShardedCollectionRoutingInfo(opCtx, _metadata.getSourceNss());
@@ -752,7 +761,7 @@ void ReshardingRecipientService::RecipientStateMachine::_cleanupReshardingCollec
         opCtx.get(), _metadata.getReshardingUUID(), _metadata.getSourceUUID(), _donorShards);
 
     if (aborted) {
-        resharding::data_copy::ensureCollectionDropped(
+        mongo::sharding_ddl_util::ensureCollectionDroppedNoChangeEvent(
             opCtx.get(), _metadata.getTempReshardingNss(), _metadata.getReshardingUUID());
     }
 }
@@ -808,27 +817,53 @@ void ReshardingRecipientService::RecipientStateMachine::_transitionToCloning(
     const CancelableOperationContextFactory& factory) {
     auto newRecipientCtx = _recipientCtx;
     newRecipientCtx.setState(RecipientStateEnum::kCloning);
+    auto cloningStartTime = getCurrentTime();
+
+    // Record cloning start time.
+    ReshardingMetricsTimeInterval interval;
+    interval.setStart(cloningStartTime);
+    _timeIntervals.setDocumentCopy(interval);
+
     _transitionState(std::move(newRecipientCtx), boost::none, boost::none, factory);
-    _metrics()->startCopyingDocuments(getCurrentTime());
+    _metrics()->startCopyingDocuments(cloningStartTime);
 }
 
 void ReshardingRecipientService::RecipientStateMachine::_transitionToApplying(
     const CancelableOperationContextFactory& factory) {
     auto newRecipientCtx = _recipientCtx;
     newRecipientCtx.setState(RecipientStateEnum::kApplying);
+    auto oplogApplicationStartTime = getCurrentTime();
+
+    // Record oplog application start time.
+    ReshardingMetricsTimeInterval interval;
+    interval.setStart(oplogApplicationStartTime);
+    _timeIntervals.setOplogApplication(interval);
+
+    // Record document copy stop time.
+    ReshardingMetricsTimeInterval documentCopy{_timeIntervals.getDocumentCopy().get_value_or({})};
+    documentCopy.setStop(oplogApplicationStartTime);
+    _timeIntervals.setDocumentCopy(documentCopy);
+
     _transitionState(std::move(newRecipientCtx), boost::none, boost::none, factory);
-    auto currentTime = getCurrentTime();
-    _metrics()->endCopyingDocuments(currentTime);
-    _metrics()->startApplyingOplogEntries(currentTime);
+    _metrics()->endCopyingDocuments(oplogApplicationStartTime);
+    _metrics()->startApplyingOplogEntries(oplogApplicationStartTime);
 }
 
 void ReshardingRecipientService::RecipientStateMachine::_transitionToStrictConsistency(
     const CancelableOperationContextFactory& factory) {
     auto newRecipientCtx = _recipientCtx;
     newRecipientCtx.setState(RecipientStateEnum::kStrictConsistency);
+    auto oplogApplicationStopTime = getCurrentTime();
+
+    // Record oplog application stop time
+    ReshardingMetricsTimeInterval oplogApplication{
+        _timeIntervals.getOplogApplication().get_value_or({})};
+    oplogApplication.setStop(oplogApplicationStopTime);
+    _timeIntervals.setOplogApplication(oplogApplication);
+
+
     _transitionState(std::move(newRecipientCtx), boost::none, boost::none, factory);
-    auto currentTime = getCurrentTime();
-    _metrics()->endApplyingOplogEntries(currentTime);
+    _metrics()->endApplyingOplogEntries(oplogApplicationStopTime);
 }
 
 void ReshardingRecipientService::RecipientStateMachine::_transitionToError(
@@ -980,12 +1015,17 @@ void ReshardingRecipientService::RecipientStateMachine::_updateRecipientDocument
 
             setBuilder.append(ReshardingRecipientDocument::kDonorShardsFieldName,
                               donorShardsArrayBuilder.arr());
+
+            setBuilder.append(ReshardingRecipientDocument::kApproxBytesToCopyFieldName,
+                              cloneDetails->approxBytesToCopy);
         }
 
         if (configStartTime) {
             setBuilder.append(ReshardingRecipientDocument::kStartConfigTxnCloneTimeFieldName,
                               *configStartTime);
         }
+
+        setBuilder.append(ReshardingRecipientDocument::kMetricsFieldName, _timeIntervals.toBSON());
 
         setBuilder.doneFast();
     }
@@ -1004,6 +1044,7 @@ void ReshardingRecipientService::RecipientStateMachine::_updateRecipientDocument
     if (cloneDetails) {
         _cloneTimestamp = cloneDetails->cloneTimestamp;
         _donorShards = std::move(cloneDetails->donorShards);
+        _approxBytesToCopy = cloneDetails->approxBytesToCopy;
     }
 
     if (configStartTime) {
@@ -1063,7 +1104,6 @@ ExecutorFuture<void> ReshardingRecipientService::RecipientStateMachine::_startMe
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
     const CancellationToken& abortToken) {
     if (_recipientCtx.getState() > RecipientStateEnum::kAwaitingFetchTimestamp) {
-        _metrics()->onStepUp(ReshardingMetrics::Role::kRecipient);
         return _restoreMetricsWithRetry(executor, abortToken);
     }
     _metrics()->onStart(ReshardingMetrics::Role::kRecipient, getCurrentTime());
@@ -1073,7 +1113,6 @@ ExecutorFuture<void> ReshardingRecipientService::RecipientStateMachine::_startMe
 ExecutorFuture<void> ReshardingRecipientService::RecipientStateMachine::_restoreMetricsWithRetry(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
     const CancellationToken& abortToken) {
-    _metrics()->setRecipientState(_recipientCtx.getState());
     return _retryingCancelableOpCtxFactory
         ->withAutomaticRetry(
             [this, executor, abortToken](const auto& factory) { _restoreMetrics(factory); })
@@ -1139,8 +1178,13 @@ void ReshardingRecipientService::RecipientStateMachine::_restoreMetrics(
         }
     }
 
-    _metrics()->restoreForCurrentOp(
-        documentCountCopied, documentBytesCopied, oplogEntriesFetched, oplogEntriesApplied);
+    _metrics()->onStepUp(_recipientCtx.getState(),
+                         ReshardingMetrics::ReshardingRecipientCountsAndMetrics{documentCountCopied,
+                                                                                documentBytesCopied,
+                                                                                oplogEntriesFetched,
+                                                                                oplogEntriesApplied,
+                                                                                _approxBytesToCopy,
+                                                                                _timeIntervals});
 }
 
 CancellationToken ReshardingRecipientService::RecipientStateMachine::_initAbortSource(

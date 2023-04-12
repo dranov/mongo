@@ -97,7 +97,7 @@ public:
 
     struct ProfileSettings {
         int level;
-        std::shared_ptr<ProfileFilter> filter;  // nullable
+        std::shared_ptr<const ProfileFilter> filter;  // nullable
 
         ProfileSettings(int level, std::shared_ptr<ProfileFilter> filter)
             : level(level), filter(filter) {
@@ -113,6 +113,19 @@ public:
         bool operator==(const ProfileSettings& other) const {
             return level == other.level && filter == other.filter;
         }
+    };
+
+    enum class ViewUpsertMode {
+        // Insert all data for that view into the view map, view graph, and durable view catalog.
+        kCreateView,
+
+        // Insert into the view map and view graph without reinserting the view into the durable
+        // view catalog. Skip view graph validation.
+        kAlreadyDurableView,
+
+        // Reload the view map, insert into the view graph (flagging it as needing refresh), and
+        // update the durable view catalog.
+        kUpdateView,
     };
 
     static std::shared_ptr<const CollectionCatalog> get(ServiceContext* svcCtx);
@@ -147,14 +160,16 @@ public:
      *
      * Must be in WriteUnitOfWork. View creation rolls back if the unit of work aborts.
      *
-     * Caller must ensure corresponding database exists.
+     * Caller must ensure corresponding database exists. Expects db.system.views MODE_X lock and
+     * view namespace MODE_IX lock (unless 'insertViewMode' is set to kAlreadyDurableView).
      */
     Status createView(OperationContext* opCtx,
                       const NamespaceString& viewName,
                       const NamespaceString& viewOn,
                       const BSONArray& pipeline,
                       const BSONObj& collation,
-                      const ViewsForDatabase::PipelineValidatorFn& pipelineValidator) const;
+                      const ViewsForDatabase::PipelineValidatorFn& pipelineValidator,
+                      ViewUpsertMode insertViewMode = ViewUpsertMode::kCreateView) const;
 
     /**
      * Drop the view named 'viewName'.
@@ -406,6 +421,11 @@ public:
     std::vector<TenantDatabaseName> getAllDbNames() const;
 
     /**
+     * Updates the profile filter on all databases with non-default settings.
+     */
+    void setAllDatabaseProfileFilters(std::shared_ptr<ProfileFilter> filter);
+
+    /**
      * Sets 'newProfileSettings' as the profiling settings for the database 'dbName'.
      */
     void setDatabaseProfileSettings(StringData dbName, ProfileSettings newProfileSettings);
@@ -474,14 +494,14 @@ public:
      *
      * Must be called with the global lock acquired in exclusive mode.
      */
-    void onCloseCatalog(OperationContext* opCtx);
+    void onCloseCatalog();
 
     /**
      * Puts the catalog back in open state, removing the pre-close state. See onCloseCatalog.
      *
      * Must be called with the global lock acquired in exclusive mode.
      */
-    void onOpenCatalog(OperationContext* opCtx);
+    void onOpenCatalog();
 
     /**
      * The epoch is incremented whenever the catalog is closed and re-opened.
@@ -548,7 +568,8 @@ private:
                                const BSONArray& pipeline,
                                const ViewsForDatabase::PipelineValidatorFn& pipelineValidator,
                                std::unique_ptr<CollatorInterface> collator,
-                               ViewsForDatabase&& viewsForDb) const;
+                               ViewsForDatabase&& viewsForDb,
+                               ViewUpsertMode insertViewMode) const;
 
     /**
      * Returns true if this CollectionCatalog instance is part of an ongoing batched catalog write.

@@ -105,6 +105,14 @@ repos:
     repos:
       - yum/redhat/8/mongodb-org
       - yum/redhat/8Server/mongodb-org
+  - name: rhel90
+    type: rpm
+    edition: org
+    bucket: repo.mongodb.org
+    repos:
+      - yum/redhat/9/mongodb-org
+      - yum/redhat/9Server/mongodb-org
+
 
   - name: amazon
     type: rpm
@@ -249,6 +257,18 @@ repos:
     repos:
       - apt/ubuntu/dists/focal/mongodb-org
 
+  - name: ubuntu2204
+    type: deb
+    code_name: "jammy"
+    edition: org
+    bucket: repo.mongodb.org
+    component: multiverse
+    architectures:
+      - amd64
+      - arm64
+    repos:
+      - apt/ubuntu/dists/jammy/mongodb-org
+
 ####################
 #
 # Enterprise Repos:
@@ -326,6 +346,14 @@ repos:
     repos:
       - yum/redhat/8/mongodb-enterprise
       - yum/redhat/8Server/mongodb-enterprise
+
+  - name: rhel90
+    type: rpm
+    edition: enterprise
+    bucket: repo.mongodb.com
+    repos:
+      - yum/redhat/9/mongodb-enterprise
+      - yum/redhat/9Server/mongodb-enterprise
 
   - name: amazon
     type: rpm
@@ -479,3 +507,15 @@ repos:
       - arm64
     repos:
       - apt/ubuntu/dists/focal/mongodb-enterprise
+
+  - name: ubuntu2204
+    type: deb
+    code_name: "jammy"
+    edition: enterprise
+    bucket: repo.mongodb.com
+    component: multiverse
+    architectures:
+      - amd64
+      - arm64
+    repos:
+      - apt/ubuntu/dists/jammy/mongodb-enterprise

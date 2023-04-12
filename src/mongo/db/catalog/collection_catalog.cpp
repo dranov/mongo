@@ -469,19 +469,27 @@ void CollectionCatalog::write(OperationContext* opCtx,
     write(opCtx->getServiceContext(), std::move(job));
 }
 
-Status CollectionCatalog::createView(
-    OperationContext* opCtx,
-    const NamespaceString& viewName,
-    const NamespaceString& viewOn,
-    const BSONArray& pipeline,
-    const BSONObj& collation,
-    const ViewsForDatabase::PipelineValidatorFn& pipelineValidator) const {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
+Status CollectionCatalog::createView(OperationContext* opCtx,
+                                     const NamespaceString& viewName,
+                                     const NamespaceString& viewOn,
+                                     const BSONArray& pipeline,
+                                     const BSONObj& collation,
+                                     const ViewsForDatabase::PipelineValidatorFn& pipelineValidator,
+                                     const ViewUpsertMode insertViewMode) const {
+    // A view document direct write can occur via the oplog application path, which may only hold a
+    // lock on the collection being updated (the database views collection).
+    invariant(insertViewMode == ViewUpsertMode::kAlreadyDurableView ||
+              opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(
         NamespaceString(viewName.db(), NamespaceString::kSystemDotViewsCollectionName), MODE_X));
 
     invariant(_viewsForDatabase.contains(viewName.db()));
     const ViewsForDatabase& viewsForDb = *_getViewsForDatabase(opCtx, viewName.db());
+
+    auto& uncommittedCatalogUpdates = UncommittedCatalogUpdates::get(opCtx);
+    if (uncommittedCatalogUpdates.shouldIgnoreExternalViewChanges(viewName.db())) {
+        return Status::OK();
+    }
 
     if (viewName.db() != viewOn.db())
         return Status(ErrorCodes::BadValue,
@@ -508,7 +516,8 @@ Status CollectionCatalog::createView(
                                      pipeline,
                                      pipelineValidator,
                                      std::move(collator.getValue()),
-                                     ViewsForDatabase{viewsForDb});
+                                     ViewsForDatabase{viewsForDb},
+                                     insertViewMode);
     }
 
     return result;
@@ -550,7 +559,8 @@ Status CollectionCatalog::modifyView(
                                      pipeline,
                                      pipelineValidator,
                                      CollatorInterface::cloneCollator(viewPtr->defaultCollator()),
-                                     ViewsForDatabase{viewsForDb});
+                                     ViewsForDatabase{viewsForDb},
+                                     ViewUpsertMode::kUpdateView);
     }
 
     return result;
@@ -689,16 +699,17 @@ void CollectionCatalog::onCloseDatabase(OperationContext* opCtx, TenantDatabaseN
     _viewsForDatabase.erase(tenantDbName.dbName());
 }
 
-void CollectionCatalog::onCloseCatalog(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isW());
-    invariant(!_shadowCatalog);
+void CollectionCatalog::onCloseCatalog() {
+    if (_shadowCatalog) {
+        return;
+    }
+
     _shadowCatalog.emplace();
     for (auto& entry : _catalog)
         _shadowCatalog->insert({entry.first, entry.second->ns()});
 }
 
-void CollectionCatalog::onOpenCatalog(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isW());
+void CollectionCatalog::onOpenCatalog() {
     invariant(_shadowCatalog);
     _shadowCatalog.reset();
     ++_epoch;
@@ -1086,6 +1097,12 @@ std::vector<TenantDatabaseName> CollectionCatalog::getAllDbNames() const {
     return ret;
 }
 
+void CollectionCatalog::setAllDatabaseProfileFilters(std::shared_ptr<ProfileFilter> filter) {
+    for (auto& [_, settings] : _databaseProfileSettings) {
+        settings.filter = filter;
+    }
+}
+
 void CollectionCatalog::setDatabaseProfileSettings(
     StringData dbName, CollectionCatalog::ProfileSettings newProfileSettings) {
     _databaseProfileSettings[dbName] = newProfileSettings;
@@ -1403,15 +1420,19 @@ Status CollectionCatalog::_createOrUpdateView(
     const BSONArray& pipeline,
     const ViewsForDatabase::PipelineValidatorFn& pipelineValidator,
     std::unique_ptr<CollatorInterface> collator,
-    ViewsForDatabase&& viewsForDb) const {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
+    ViewsForDatabase&& viewsForDb,
+    ViewUpsertMode insertViewMode) const {
+    // A view document direct write can occur via the oplog application path, which may only hold a
+    // lock on the collection being updated (the database views collection).
+    invariant(insertViewMode == ViewUpsertMode::kAlreadyDurableView ||
+              opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(
         NamespaceString(viewName.db(), NamespaceString::kSystemDotViewsCollectionName), MODE_X));
 
     viewsForDb.requireValidCatalog();
 
-    // Build the BSON definition for this view to be saved in the durable view catalog. If the
-    // collation is empty, omit it from the definition altogether.
+    // Build the BSON definition for this view to be saved in the durable view catalog and/or to
+    // insert in the viewMap. If the collation is empty, omit it from the definition altogether.
     BSONObjBuilder viewDefBuilder;
     viewDefBuilder.append("_id", viewName.ns());
     viewDefBuilder.append("viewOn", viewOn.coll());
@@ -1420,25 +1441,42 @@ Status CollectionCatalog::_createOrUpdateView(
         viewDefBuilder.append("collation", collator->getSpec().toBSON());
     }
 
+    BSONObj viewDef = viewDefBuilder.obj();
     BSONObj ownedPipeline = pipeline.getOwned();
-    auto view = std::make_shared<ViewDefinition>(
+    ViewDefinition view(
         viewName.db(), viewName.coll(), viewOn.coll(), ownedPipeline, std::move(collator));
 
-    // Check that the resulting dependency graph is acyclic and within the maximum depth.
-    Status graphStatus = viewsForDb.upsertIntoGraph(opCtx, *(view.get()), pipelineValidator);
+    // If the view is already in the durable view catalog, we don't need to validate the graph. If
+    // we need to update the durable view catalog, we need to check that the resulting dependency
+    // graph is acyclic and within the maximum depth.
+    const bool viewGraphNeedsValidation = insertViewMode != ViewUpsertMode::kAlreadyDurableView;
+    Status graphStatus =
+        viewsForDb.upsertIntoGraph(opCtx, view, pipelineValidator, viewGraphNeedsValidation);
     if (!graphStatus.isOK()) {
         return graphStatus;
     }
 
-    viewsForDb.durable->upsert(opCtx, viewName, viewDefBuilder.obj());
+    if (insertViewMode != ViewUpsertMode::kAlreadyDurableView) {
+        viewsForDb.durable->upsert(opCtx, viewName, viewDef);
+    }
 
-    viewsForDb.viewMap.clear();
     viewsForDb.valid = false;
-    viewsForDb.viewGraphNeedsRefresh = true;
-    viewsForDb.stats = {};
+    auto res = [&] {
+        switch (insertViewMode) {
+            case ViewUpsertMode::kCreateView:
+            case ViewUpsertMode::kAlreadyDurableView:
+                return viewsForDb.insert(opCtx, viewDef);
+            case ViewUpsertMode::kUpdateView:
+                viewsForDb.viewMap.clear();
+                viewsForDb.viewGraphNeedsRefresh = true;
+                viewsForDb.stats = {};
 
-    // Reload the view catalog with the changes applied.
-    auto res = viewsForDb.reload(opCtx);
+                // Reload the view catalog with the changes applied.
+                return viewsForDb.reload(opCtx);
+        }
+        MONGO_UNREACHABLE;
+    }();
+
     if (res.isOK()) {
         auto& uncommittedCatalogUpdates = UncommittedCatalogUpdates::get(opCtx);
         uncommittedCatalogUpdates.addView(opCtx, viewName);
@@ -1527,10 +1565,7 @@ const Collection* LookupCollectionForYieldRestore::operator()(OperationContext* 
     // state. After a query yields its locks, the replication state may have changed, invalidating
     // our current choice of ReadSource. Using the same preconditions, change our ReadSource if
     // necessary.
-    auto [newReadSource, _] = SnapshotHelper::shouldChangeReadSource(opCtx, collection->ns());
-    if (newReadSource) {
-        opCtx->recoveryUnit()->setTimestampReadSource(*newReadSource);
-    }
+    SnapshotHelper::changeReadSourceIfNeeded(opCtx, collection->ns());
 
     return collection.get();
 }

@@ -2,7 +2,6 @@
  * Basic tests for moveRange.
  *
  * @tags: [
- *    featureFlagNoMoreAutoSplitter,
  *    requires_fcv_60,
  * ]
  */

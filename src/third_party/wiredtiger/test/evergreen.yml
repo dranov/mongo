@@ -11,7 +11,8 @@ stepback: true
 pre:
   - func: "cleanup"
 post:
-  - func: "print python stacktrace"
+  - func: "dump stacktraces"
+  - func: "upload stacktraces"
   - func: "dump stderr/stdout"
   - func: "upload artifact"
     vars:
@@ -244,6 +245,25 @@ functions:
             # Save generated documentation
             mv docs docs-$branch
           done
+  "dump stacktraces": &dump_stacktraces
+    command: shell.exec
+    params:
+      working_dir: "wiredtiger/cmake_build"
+      script: |
+        set -o errexit
+        set -o verbose
+        ${python_binary|python3} ../test/evergreen/print_stack_trace.py
+  "upload stacktraces": &upload_stacktraces
+    command: s3.put
+    params:
+      aws_secret: ${aws_secret}
+      aws_key: ${aws_key}
+      local_files_include_filter:
+        - wiredtiger/cmake_build/*stacktrace.txt
+      bucket: build_external
+      permissions: public-read
+      content_type: text/plain
+      remote_file: wiredtiger/${build_variant}/${revision}/artifacts/${task_name}_${build_id}/
 
   "update wiredtiger docs":
     - command: shell.exec
@@ -504,17 +524,6 @@ functions:
         display_name: WT Hang Analyzer Output - Execution ${execution}
         remote_file: wiredtiger/${build_variant}/${revision}/wt_hang_analyzer/wt-hang-analyzer_${task_name}_${build_id}${postfix|}.tgz
 
-  "print python stacktrace":
-    command: shell.exec
-    params:
-      working_dir: "wiredtiger/cmake_build"
-      script: |
-        set -o errexit
-        set -o verbose
-        if [ -d "WT_TEST" ]; then
-          ${python_binary|python3} ../test/evergreen/print_python_stack_trace.py -e ${python_binary|python3} -c WT_TEST -l .
-        fi
-
   "dump stderr/stdout":
     command: shell.exec
     params:
@@ -681,6 +690,22 @@ variables:
       - func: "format test script"
         vars:
           format_test_script_args: -e "SEGFAULT_SIGNALS=all" -b "catchsegv ./t" -t 360
+
+  - &format-stress-sanitizer-ppc-test
+    exec_timeout_secs: 25200
+    commands:
+      - func: "get project"
+      - func: "compile wiredtiger"
+        vars:
+          posix_configure_flags: -DCMAKE_TOOLCHAIN_FILE=../cmake/toolchains/mongodbtoolchain_v4_clang.cmake -DCMAKE_BUILD_TYPE=ASan -DHAVE_BUILTIN_EXTENSION_LZ4=1 -DHAVE_BUILTIN_EXTENSION_SNAPPY=1 -DHAVE_BUILTIN_EXTENSION_ZLIB=1
+      - func: "format test script"
+        vars:
+          # Always disable mmap for PPC due to issues on variant setup.
+          # See https://bugzilla.redhat.com/show_bug.cgi?id=1686261#c10 for the potential cause.
+          format_test_script_args: -t 360 -- -C "mmap=false,mmap_all=false"
+          test_env_vars:
+            ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:disable_coredump=0:unmap_shadow_on_exit=1"
+            ASAN_SYMBOLIZER_PATH=/opt/mongodbtoolchain/v4/bin/llvm-symbolizer
 
   - &format-stress-sanitizer-test
     exec_timeout_secs: 25200
@@ -2538,6 +2563,20 @@ tasks:
             set -o errexit
             set -o verbose
             ${test_env_vars|} ../../../tools/run_parallel.sh 'nice ./recovery-test.sh "${data_validation_stress_test_args} -s 5" WT_TEST.$t test_checkpoint' 120
+  
+  - name: data-validation-stress-test-checkpoint-fp-hs-insert-s7
+    depends_on:
+    - name: compile
+    commands:
+      - func: "fetch artifacts"
+      - command: shell.exec
+        params:
+          working_dir: "wiredtiger/cmake_build/test/checkpoint"
+          shell: bash
+          script: |
+            set -o errexit
+            set -o verbose
+            ${test_env_vars|} ../../../tools/run_parallel.sh 'nice ./recovery-test.sh "${data_validation_stress_test_args} -s 7" WT_TEST.$t test_checkpoint' 120
 
   - name: format-failure-configs-test
     depends_on:
@@ -2630,9 +2669,8 @@ tasks:
             set -o verbose
             for i in {1..10}; do ${test_env_vars|} ${python_binary|python3} split_stress.py; done
 
-  # The task name is ppc-zseries because this task will be used in both buildVariants
-  - name: format-stress-ppc-zseries-test
-    tags: ["stress-test-ppc-1", "stress-test-zseries-1"]
+  - name: format-stress-zseries-test
+    tags: ["stress-test-zseries-1"]
     # Set 2.5 hours timeout (60 * 60 * 2.5)
     exec_timeout_secs: 9000
     commands:
@@ -2642,6 +2680,22 @@ tasks:
         vars:
           #run for 2 hours ( 2 * 60 = 120 minutes), use default config
           format_test_script_args: -e "SEGFAULT_SIGNALS=all" -b "catchsegv ./t" -t 120
+
+  - name: format-stress-ppc-test
+    tags: ["stress-test-ppc-1"]
+    # Set 2.5 hours timeout (60 * 60 * 2.5)
+    exec_timeout_secs: 9000
+    commands:
+      - func: "get project"
+      - func: "compile wiredtiger"
+        vars: 
+          posix_configure_flags: -DCMAKE_TOOLCHAIN_FILE=../cmake/toolchains/mongodbtoolchain_v3_gcc.cmake -DHAVE_BUILTIN_EXTENSION_LZ4=1 -DHAVE_BUILTIN_EXTENSION_SNAPPY=1 -DHAVE_BUILTIN_EXTENSION_ZLIB=1
+      - func: "format test script"
+        vars:
+          #run for 2 hours ( 2 * 60 = 120 minutes), use default config
+          # Always disable mmap for PPC due to issues on variant setup.
+          # See https://bugzilla.redhat.com/show_bug.cgi?id=1686261#c10 for the potential cause.
+          format_test_script_args: -e "SEGFAULT_SIGNALS=all" -b "catchsegv ./t" -t 120 -- -C "mmap=false,mmap_all=false"
 
   - <<: *format-stress-test
     name: format-stress-test-1
@@ -2655,12 +2709,18 @@ tasks:
   - <<: *format-stress-test
     name: format-stress-test-4
     tags: ["stress-test-4"]
+  - <<: *format-stress-sanitizer-ppc-test
+    name: format-stress-sanitizer-ppc-test-1
+    tags: ["stress-test-ppc-1"]
+  - <<: *format-stress-sanitizer-ppc-test
+    name: format-stress-sanitizer-ppc-test-2
+    tags: ["stress-test-ppc-2"]
   - <<: *format-stress-sanitizer-test
     name: format-stress-sanitizer-test-1
-    tags: ["stress-test-1", "stress-test-ppc-1"]
+    tags: ["stress-test-sanitizer-1"]
   - <<: *format-stress-sanitizer-test
     name: format-stress-sanitizer-test-2
-    tags: ["stress-test-2", "stress-test-ppc-2"]
+    tags: ["stress-test-sanitizer-2"]
   - <<: *format-stress-sanitizer-test
     name: format-stress-sanitizer-test-3
     tags: ["stress-test-3"]
@@ -3686,6 +3746,7 @@ buildvariants:
       -DHAVE_DIAGNOSTIC=1
       -DENABLE_PYTHON=1
       -DENABLE_ZLIB=1
+      -DENABLE_ZSTD=1
       -DENABLE_SNAPPY=1
       -DENABLE_STRICT=1
       -DENABLE_TCMALLOC=1
@@ -3727,6 +3788,7 @@ buildvariants:
     - name: data-validation-stress-test-checkpoint-fp-hs-insert-s4
     - name: data-validation-stress-test-checkpoint-fp-hs-insert-s5
     - name: data-validation-stress-test-checkpoint-fp-hs-insert-s5-no-timestamp
+    - name: data-validation-stress-test-checkpoint-fp-hs-insert-s7
     - name: data-validation-stress-test-checkpoint-no-timestamp
     - name: unittest-test
     - name: tiered-storage-extensions-test
@@ -3933,73 +3995,6 @@ buildvariants:
     - name: ".stress-test-no-barrier"
     - name: format-abort-recovery-stress-test
 
-- name: ubuntu2004-perf-tests
-  display_name: Ubuntu 20.04 Performance tests
-  # Perf tests are NOT expected to be triggered on Evergreen projects
-  # other than "WiredTiger (develop)".
-  activate: false
-  batchtime: 1440 # 1 day
-  run_on:
-    - ubuntu2004-medium
-  expansions:
-    test_env_vars:
-      WT_TOPDIR=$(git rev-parse --show-toplevel)
-      WT_BUILDDIR=$WT_TOPDIR/cmake_build
-      LD_LIBRARY_PATH=$WT_BUILDDIR:$WT_BUILDDIR/test/utility/
-    posix_configure_flags:
-      -DCMAKE_TOOLCHAIN_FILE=../cmake/toolchains/mongodbtoolchain_v3_gcc.cmake
-      -DCMAKE_C_FLAGS="-ggdb"
-      -DHAVE_DIAGNOSTIC=1
-      -DENABLE_PYTHON=1
-      -DENABLE_ZLIB=1
-      -DENABLE_SNAPPY=1
-      -DENABLE_STRICT=1
-      -DCMAKE_INSTALL_PREFIX=$(pwd)/LOCAL_INSTALL
-    python_binary: '/opt/mongodbtoolchain/v3/bin/python3'
-    pip3_binary: '/opt/mongodbtoolchain/v3/bin/pip3'
-    virtualenv_binary: '/opt/mongodbtoolchain/v3/bin/virtualenv'
-    smp_command: -j $(echo "`grep -c ^processor /proc/cpuinfo` * 2" | bc)
-    cmake_generator: Ninja
-    make_command: ninja
-  tasks:
-    - name: compile
-    - name: ".btree-perf"
-    # Disable LSM perf tests till the support for LSM is restored.
-    # - name: ".lsm-perf"
-    - name: ".stress-perf"
-    - name: ".checkpoint-perf"
-    - name: ".evict-perf"
-    - name: ".log-perf"
-    - name: ".long-perf"
-    - name: many-dhandle-stress
-    - name: ".wt2853-perf"
-  display_tasks:
-    - name: Wiredtiger-perf-btree-jobs
-      execution_tasks:
-      - ".btree-perf"
-    # Disable LSM perf tests till the support for LSM is restored.
-    # - name: Wiredtiger-perf-lsm-jobs
-    #   execution_tasks:
-    #   - ".lsm-perf"
-    - name: Wiredtiger-perf-stress-jobs
-      execution_tasks:
-      - ".stress-perf"
-    - name: Wiredtiger-perf-checkpoint-jobs
-      execution_tasks:
-      - ".checkpoint-perf"
-    - name: Wiredtiger-perf-evict-jobs
-      execution_tasks:
-      - ".evict-perf"
-    - name: Wiredtiger-perf-log-jobs
-      execution_tasks:
-      - ".log-perf"
-    - name: Wiredtiger-perf-long-jobs
-      execution_tasks:
-      - ".long-perf"
-    - name: WiredTiger-wt2853-perf
-      execution_tasks:
-      - ".wt2853-perf"
-
 - name: large-scale-tests
   display_name: "Large scale tests"
   batchtime: 480 # 3 times a day
@@ -4065,19 +4060,6 @@ buildvariants:
   tasks:
     - name: package
 
-- name: documentation-update
-  display_name: "~ Documentation update"
-  # Documentation update is NOT expected to be triggered on Evergreen projects
-  # other than "WiredTiger (develop)"
-  activate: false
-  batchtime: 10080 # 7 days
-  run_on:
-  - ubuntu2004-test
-  expansions:
-    doc_update_branches: develop,mongodb-5.0,mongodb-4.4,mongodb-4.2,mongodb-4.0
-  tasks:
-    - name: doc-update
-
 - name: linux-no-ftruncate
   display_name: Linux no ftruncate
   batchtime: 1440 # 1 day
@@ -4135,62 +4117,6 @@ buildvariants:
     - name: ftruncate-test
     - name: long-test
     - name: configure-combinations
-
-- name: code-statistics
-  display_name: "Code statistics"
-  # Code coverage and complexity metrics are NOT expected to be triggered on Evergreen projects
-  # other than "WiredTiger (develop)".
-  activate: false
-  batchtime: 10080 # 7 days
-  run_on:
-  - ubuntu2004-test
-  expansions:
-    test_env_vars:
-      LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libeatmydata.so
-      PATH=/opt/mongodbtoolchain/v3/bin:$PATH
-      WT_TOPDIR=$(git rev-parse --show-toplevel)
-      WT_BUILDDIR=$WT_TOPDIR/cmake_build
-      LD_LIBRARY_PATH=$WT_BUILDDIR:$WT_TOPDIR/TCMALLOC_LIB/lib
-    make_command: ninja
-    cmake_generator: Ninja
-  tasks:
-    - name: coverage-report
-    - name: cyclomatic-complexity
-
-- name: compatibility-tests-less-frequent
-  display_name: Compatibility tests (less frequent)
-  # Compatibility tests are NOT expected to be triggered on Evergreen projects
-  # other than "WiredTiger (develop)".
-  activate: false
-  batchtime: 10080 # 7 days
-  run_on:
-  - ubuntu1804-test
-  tasks:
-    - name: compatibility-test-for-older-releases
-    - name: compatibility-test-for-wt-standalone-releases
-
-- name: compatibility-tests-daily
-  display_name: Compatibility tests (daily)
-  # Compatibility tests are NOT expected to be triggered on Evergreen projects
-  # other than "WiredTiger (develop)".
-  activate: false
-  batchtime: 1440 # 1 day
-  run_on:
-  - ubuntu2004-test
-  tasks:
-    - name: compatibility-test-upgrade-to-latest
-
-- name: compatibility-tests
-  display_name: Compatibility tests
-  # Compatibility tests are NOT expected to be triggered on Evergreen projects
-  # other than "WiredTiger (develop)".
-  activate: false
-  run_on:
-  - ubuntu2004-test
-  tasks:
-    - name: compatibility-test-for-newer-releases
-    - name: compatibility-test-for-patch-releases
-    - name: import-compatibility-test
 
 - name: windows-64
   display_name: "! Windows 64-bit"
@@ -4282,8 +4208,6 @@ buildvariants:
 
 - name: rhel8-ppc
   display_name: "~ RHEL8 PPC"
-  # FIXME-WT-8981
-  activate: false
   run_on:
   - rhel81-power8-small
   batchtime: 120 # 2 hours
@@ -4302,8 +4226,8 @@ buildvariants:
       -DENABLE_STRICT=1
       -DCMAKE_INSTALL_PREFIX=$(pwd)/LOCAL_INSTALL
     python_binary: '/opt/mongodbtoolchain/v4/bin/python3'
-    # Use half number of vCPU to avoid OOM kill failure
-    smp_command: -j $(echo $(grep -c ^processor /proc/cpuinfo) / 2 | bc)
+    # Use quarter of the vCPUs to avoid OOM kill failure and disk issues on this variant.
+    smp_command: -j $(echo $(grep -c ^processor /proc/cpuinfo) / 4 | bc)
     cmake_generator: Ninja
     make_command: ninja
   tasks:

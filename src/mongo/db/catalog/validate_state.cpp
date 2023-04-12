@@ -54,12 +54,12 @@ ValidateState::ValidateState(OperationContext* opCtx,
                              const NamespaceString& nss,
                              ValidateMode mode,
                              RepairMode repairMode,
-                             bool turnOnExtraLoggingForTest)
+                             bool logDiagnostics)
     : _nss(nss),
       _mode(mode),
       _repairMode(repairMode),
       _dataThrottle(opCtx),
-      _extraLoggingForTest(turnOnExtraLoggingForTest) {
+      _logDiagnostics(logDiagnostics) {
 
     // Subsequent re-locks will use the UUID when 'background' is true.
     if (isBackground()) {
@@ -245,8 +245,10 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
         const IndexDescriptor* desc = entry->descriptor();
 
         auto iam = entry->accessMethod()->asSortedData();
-        if (!iam)
+        if (!iam) {
+            _skippedIndexes.emplace(desc->indexName());
             continue;
+        }
 
         _indexCursors.emplace(
             desc->indexName(),

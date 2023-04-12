@@ -46,7 +46,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/write_stage_common.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -71,6 +71,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/timeseries/bucket_catalog.h"
+#include "mongo/db/timeseries/timeseries_extended_range.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_participant_gen.h"
 #include "mongo/db/views/durable_view_catalog.h"
@@ -78,6 +79,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 
@@ -315,8 +317,15 @@ void writeToImageCollection(OperationContext* opCtx,
     AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(opCtx->lockState());
     AutoGetCollection imageCollectionRaii(
         opCtx, NamespaceString::kConfigImagesNamespace, LockMode::MODE_IX);
+    auto curOp = CurOp::get(opCtx);
+    const std::string existingNs = curOp->getNS();
     UpdateResult res = Helpers::upsert(
         opCtx, NamespaceString::kConfigImagesNamespace.toString(), imageEntry.toBSON());
+    {
+        stdx::lock_guard<Client> clientLock(*opCtx->getClient());
+        curOp->setNS_inlock(existingNs);
+    }
+
     invariant(res.numDocsModified == 1 || !res.upsertedId.isEmpty());
 }
 
@@ -602,7 +611,15 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
     if (nss.coll() == "system.js") {
         Scope::storedFuncMod(opCtx);
     } else if (nss.coll() == DurableViewCatalog::viewsCollectionName()) {
-        DurableViewCatalog::onExternalChange(opCtx, nss);
+        try {
+            for (auto it = first; it != last; it++) {
+                uassertStatusOK(DurableViewCatalog::onExternalInsert(opCtx, it->doc, nss));
+            }
+        } catch (const DBException&) {
+            // If a previous operation left the view catalog in an invalid state, our inserts can
+            // fail even if all the definitions are valid. Reloading may help us reset the state.
+            DurableViewCatalog::onExternalChange(opCtx, nss);
+        }
     } else if (nss == NamespaceString::kSessionTransactionsTableNamespace && !lastOpTime.isNull()) {
         for (auto it = first; it != last; it++) {
             MongoDSessionCatalog::observeDirectWriteToConfigTransactions(opCtx, it->doc);
@@ -624,6 +641,27 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
                         validator->cacheExternalKey(externalKey);
                     }
                 });
+        }
+    } else if (nss.isTimeseriesBucketsCollection()) {
+        // Check if the bucket _id is sourced from a date outside the standard range. If our writes
+        // end up erroring out or getting rolled back, then this flag will stay set. This is okay
+        // though, as it only disables some query optimizations and won't result in any correctness
+        // issues if the flag is set when it doesn't need to be (as opposed to NOT being set when it
+        // DOES need to be -- that will cause correctness issues). Additionally, if the user tried
+        // to insert measurements with dates outside the standard range, chances are they will do so
+        // again, and we will have only set the flag a little early.
+        invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IX));
+        auto bucketsColl =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespaceForRead(opCtx, nss);
+        tassert(6905201, "Could not find collection for write", bucketsColl);
+        auto timeSeriesOptions = bucketsColl->getTimeseriesOptions();
+        if (timeSeriesOptions.has_value()) {
+            if (auto currentSetting = bucketsColl->getRequiresTimeseriesExtendedRangeSupport();
+                !currentSetting &&
+                timeseries::bucketsHaveDateOutsideStandardRange(
+                    timeSeriesOptions.value(), first, last)) {
+                bucketsColl->setRequiresTimeseriesExtendedRangeSupport(opCtx);
+            }
         }
     }
 }
@@ -714,6 +752,14 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
             operation.setChangeStreamPreImageRecordingMode(
                 ChangeStreamPreImageRecordingMode::kPreImagesCollection);
         }
+
+        auto collectionDescription =
+            CollectionShardingState::get(opCtx, args.nss)->getCollectionDescription(opCtx);
+        if (collectionDescription.isSharded()) {
+            operation.setPostImageDocumentKey(
+                collectionDescription.extractDocumentKey(args.updateArgs->updatedDoc).getOwned());
+        }
+
         operation.setDestinedRecipient(
             shardingWriteRouter.getReshardingDestinedRecipient(args.updateArgs->updatedDoc));
         operation.setFromMigrateIfTrue_BackwardsCompatible(args.updateArgs->source ==
@@ -2170,6 +2216,12 @@ void OpObserverImpl::onTransactionPrepare(
     }
 
     shardObserveTransactionPrepareOrUnpreparedCommit(opCtx, *statements, prepareOpTime);
+}
+
+void OpObserverImpl::onTransactionPrepareNonPrimary(OperationContext* opCtx,
+                                                    const std::vector<repl::OplogEntry>& statements,
+                                                    const repl::OpTime& prepareOpTime) {
+    shardObserveNonPrimaryTransactionPrepare(opCtx, statements, prepareOpTime);
 }
 
 void OpObserverImpl::onTransactionAbort(OperationContext* opCtx,

@@ -58,6 +58,8 @@ const std::string kProgress("progress");
 const std::string kNoPhase("none");
 const std::string kRemainingChunksToProcess("remainingChunksToProcess");
 
+static constexpr int64_t kBigChunkMarker = std::numeric_limits<int64_t>::max();
+
 ChunkVersion getShardVersion(OperationContext* opCtx,
                              const ShardId& shardId,
                              const NamespaceString& nss) {
@@ -166,6 +168,11 @@ public:
         auto collectionChunks = getCollectionChunks(opCtx, coll);
         const auto collectionZones = getCollectionZones(opCtx, coll);
 
+        // Calculate small chunk threshold to limit dataSize commands
+        const auto maxChunkSizeBytes = getCollectionMaxChunkSizeBytes(opCtx, coll);
+        const int64_t smallChunkSizeThreshold =
+            (maxChunkSizeBytes / 100) * kSmallChunkSizeThresholdPctg;
+
         stdx::unordered_map<ShardId, PendingActions> pendingActionsByShards;
         // Find ranges of chunks; for single-chunk ranges, request DataSize; for multi-range, issue
         // merge
@@ -192,6 +199,7 @@ public:
             new MergeAndMeasureChunksPhase(coll.getNss(),
                                            coll.getUuid(),
                                            coll.getKeyPattern().toBSON(),
+                                           smallChunkSizeThreshold,
                                            std::move(pendingActionsByShards)));
     }
 
@@ -217,8 +225,15 @@ public:
 
             if (pendingActions.rangesWithoutDataSize.size() > pendingActions.rangesToMerge.size()) {
                 const auto& rangeToMeasure = pendingActions.rangesWithoutDataSize.back();
-                nextAction = boost::optional<DefragmentationAction>(DataSizeInfo(
-                    shardId, _nss, _uuid, rangeToMeasure, shardVersion, _shardKey, false));
+                nextAction = boost::optional<DefragmentationAction>(
+                    DataSizeInfo(shardId,
+                                 _nss,
+                                 _uuid,
+                                 rangeToMeasure,
+                                 shardVersion,
+                                 _shardKey,
+                                 true /* estimate */,
+                                 _smallChunkSizeThresholdBytes /* maxSize */));
                 pendingActions.rangesWithoutDataSize.pop_back();
             } else if (!pendingActions.rangesToMerge.empty()) {
                 const auto& rangeToMerge = pendingActions.rangesToMerge.back();
@@ -245,7 +260,7 @@ public:
     }
 
     boost::optional<MigrateInfo> popNextMigration(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) override {
+        OperationContext* opCtx, stdx::unordered_set<ShardId>* availableShards) override {
         return boost::none;
     }
 
@@ -291,10 +306,17 @@ public:
                                             dataSizeAction.version,
                                             dataSizeAction.shardId);
                             auto catalogManager = ShardingCatalogManager::get(opCtx);
+                            // Max out the chunk size if it has has been estimated as
+                            // bigger than _smallChunkSizeThresholdBytes; this will exlude
+                            // the chunk from the list of candidates considered by
+                            // MoveAndMergeChunksPhase
+                            auto estimatedSize = dataSizeResponse.getValue().maxSizeReached
+                                ? kBigChunkMarker
+                                : dataSizeResponse.getValue().sizeBytes;
                             catalogManager->setChunkEstimatedSize(
                                 opCtx,
                                 chunk,
-                                dataSizeResponse.getValue().sizeBytes,
+                                estimatedSize,
                                 ShardingCatalogClient::kMajorityWriteConcern);
                         },
                         [&]() {
@@ -347,10 +369,12 @@ private:
         const NamespaceString& nss,
         const UUID& uuid,
         const BSONObj& shardKey,
+        const int64_t smallChunkSizeThresholdBytes,
         stdx::unordered_map<ShardId, PendingActions>&& pendingActionsByShards)
         : _nss(nss),
           _uuid(uuid),
           _shardKey(shardKey),
+          _smallChunkSizeThresholdBytes(smallChunkSizeThresholdBytes),
           _pendingActionsByShards(std::move(pendingActionsByShards)) {}
 
     void _abort(const DefragmentationPhaseEnum nextPhase) {
@@ -362,6 +386,7 @@ private:
     const NamespaceString _nss;
     const UUID _uuid;
     const BSONObj _shardKey;
+    const int64_t _smallChunkSizeThresholdBytes;
     stdx::unordered_map<ShardId, PendingActions> _pendingActionsByShards;
     boost::optional<ShardId> _shardToProcess;
     size_t _outstandingActions{0};
@@ -396,7 +421,8 @@ public:
                                         std::move(collectionChunks),
                                         std::move(shardInfos),
                                         std::move(collectionZones),
-                                        smallChunkSizeThresholdBytes));
+                                        smallChunkSizeThresholdBytes,
+                                        maxChunkSizeBytes));
     }
 
     DefragmentationPhaseEnum getType() const override {
@@ -422,9 +448,9 @@ public:
     }
 
     boost::optional<MigrateInfo> popNextMigration(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) override {
+        OperationContext* opCtx, stdx::unordered_set<ShardId>* availableShards) override {
         for (const auto& shardId : _shardProcessingOrder) {
-            if (usedShards->count(shardId) != 0) {
+            if (availableShards->count(shardId) == 0) {
                 // the shard is already busy in a migration
                 continue;
             }
@@ -432,7 +458,7 @@ public:
             ChunkRangeInfoIterator nextSmallChunk;
             std::list<ChunkRangeInfoIterator> candidateSiblings;
             if (!_findNextSmallChunkInShard(
-                    shardId, *usedShards, &nextSmallChunk, &candidateSiblings)) {
+                    shardId, *availableShards, &nextSmallChunk, &candidateSiblings)) {
                 // there isn't a chunk in this shard that can currently be moved and merged with one
                 // of its siblings.
                 continue;
@@ -455,11 +481,12 @@ public:
             // ... then build up the migration request, marking the needed resources as busy.
             nextSmallChunk->busyInOperation = true;
             targetSibling->busyInOperation = true;
-            usedShards->insert(nextSmallChunk->shard);
-            usedShards->insert(targetSibling->shard);
+            availableShards->erase(nextSmallChunk->shard);
+            availableShards->erase(targetSibling->shard);
             auto smallChunkVersion = getShardVersion(opCtx, nextSmallChunk->shard, _nss);
             _outstandingMigrations.emplace_back(nextSmallChunk, targetSibling);
-            return _outstandingMigrations.back().asMigrateInfo(_uuid, _nss, smallChunkVersion);
+            return _outstandingMigrations.back().asMigrateInfo(
+                _uuid, _nss, smallChunkVersion, _maxChunkSizeBytes);
         }
 
         return boost::none;
@@ -494,6 +521,7 @@ public:
                                 _nss, boost::none, moveRequest.getDestinationShard());
 
                         auto transferredAmount = moveRequest.getMovedDataSizeBytes();
+                        invariant(transferredAmount <= _smallChunkSizeThresholdBytes);
                         _shardInfos.at(moveRequest.getSourceShard()).currentSizeBytes -=
                             transferredAmount;
                         _shardInfos.at(moveRequest.getDestinationShard()).currentSizeBytes +=
@@ -516,6 +544,14 @@ public:
 
                     moveRequest.chunkToMove->busyInOperation = false;
                     moveRequest.chunkToMergeWith->busyInOperation = false;
+
+                    if (migrationResponse.code() == ErrorCodes::ChunkTooBig ||
+                        migrationResponse.code() == ErrorCodes::ExceededMemoryLimit) {
+                        // Never try moving this chunk again, it isn't actually small
+                        _removeIteratorFromSmallChunks(moveRequest.chunkToMove,
+                                                       moveRequest.chunkToMove->shard);
+                        return;
+                    }
 
                     if (isRetriableForDefragmentation(migrationResponse)) {
                         // The migration will be eventually retried
@@ -574,7 +610,12 @@ public:
 
                         auto& chunkToDelete = mergeRequest.chunkToMove;
                         mergedChunk->range = mergeRequest.asMergedRange();
-                        mergedChunk->estimatedSizeBytes += chunkToDelete->estimatedSizeBytes;
+                        if (mergedChunk->estimatedSizeBytes != kBigChunkMarker &&
+                            chunkToDelete->estimatedSizeBytes != kBigChunkMarker) {
+                            mergedChunk->estimatedSizeBytes += chunkToDelete->estimatedSizeBytes;
+                        } else {
+                            mergedChunk->estimatedSizeBytes = kBigChunkMarker;
+                        }
                         mergedChunk->busyInOperation = false;
                         auto deletedChunkShard = chunkToDelete->shard;
                         // the lookup data structures...
@@ -703,7 +744,8 @@ private:
 
         MigrateInfo asMigrateInfo(const UUID& collUuid,
                                   const NamespaceString& nss,
-                                  const ChunkVersion& version) const {
+                                  const ChunkVersion& version,
+                                  uint64_t maxChunkSizeBytes) const {
             return MigrateInfo(chunkToMergeWith->shard,
                                chunkToMove->shard,
                                nss,
@@ -711,7 +753,8 @@ private:
                                chunkToMove->range.getMin(),
                                chunkToMove->range.getMax(),
                                version,
-                               MoveChunkRequest::ForceJumbo::kForceBalancer);
+                               MoveChunkRequest::ForceJumbo::kDoNotForce,
+                               maxChunkSizeBytes);
         }
 
         ChunkRange asMergedRange() const {
@@ -739,7 +782,7 @@ private:
             return chunkToMove->range.getMin();
         }
 
-        uint64_t getMovedDataSizeBytes() const {
+        int64_t getMovedDataSizeBytes() const {
             return chunkToMove->estimatedSizeBytes;
         }
 
@@ -749,8 +792,6 @@ private:
     private:
         bool _isChunkToMergeLeftSibling;
     };
-
-    static constexpr uint64_t kSmallChunkSizeThresholdPctg = 25;
 
     const NamespaceString _nss;
 
@@ -776,6 +817,8 @@ private:
 
     const int64_t _smallChunkSizeThresholdBytes;
 
+    const uint64_t _maxChunkSizeBytes;
+
     bool _aborted{false};
 
     DefragmentationPhaseEnum _nextPhase{DefragmentationPhaseEnum::kMergeChunks};
@@ -785,7 +828,8 @@ private:
                             std::vector<ChunkType>&& collectionChunks,
                             stdx::unordered_map<ShardId, ShardInfo>&& shardInfos,
                             ZoneInfo&& collectionZones,
-                            uint64_t smallChunkSizeThresholdBytes)
+                            uint64_t smallChunkSizeThresholdBytes,
+                            uint64_t maxChunkSizeBytes)
         : _nss(nss),
           _uuid(uuid),
           _collectionChunks(),
@@ -796,7 +840,8 @@ private:
           _actionableMerges(),
           _outstandingMerges(),
           _zoneInfo(std::move(collectionZones)),
-          _smallChunkSizeThresholdBytes(smallChunkSizeThresholdBytes) {
+          _smallChunkSizeThresholdBytes(smallChunkSizeThresholdBytes),
+          _maxChunkSizeBytes(maxChunkSizeBytes) {
 
         // Load the collection routing table in a std::list to ease later manipulation
         for (auto&& chunk : collectionChunks) {
@@ -880,7 +925,7 @@ private:
     // Returns true on success (storing the related info in nextSmallChunk + smallChunkSiblings),
     // false otherwise.
     bool _findNextSmallChunkInShard(const ShardId& shard,
-                                    const stdx::unordered_set<ShardId>& usedShards,
+                                    const stdx::unordered_set<ShardId>& availableShards,
                                     ChunkRangeInfoIterator* nextSmallChunk,
                                     std::list<ChunkRangeInfoIterator>* smallChunkSiblings) {
         auto matchingShardInfo = _smallChunksByShard.find(shard);
@@ -906,7 +951,7 @@ private:
             size_t siblingsDiscardedDueToRangeDeletion = 0;
 
             for (const auto& sibling : candidateSiblings) {
-                if (sibling->busyInOperation || usedShards.count(sibling->shard)) {
+                if (sibling->busyInOperation || !availableShards.count(sibling->shard)) {
                     continue;
                 }
                 if ((*candidateIt)->shardsToAvoid.count(sibling->shard)) {
@@ -978,8 +1023,10 @@ private:
                    mergeableSibling.estimatedSizeBytes) {
             ranking += kConvenientMove;
         }
-        auto estimatedMergedSize =
-            chunkTobeMovedAndMerged.estimatedSizeBytes + mergeableSibling.estimatedSizeBytes;
+        auto estimatedMergedSize = (chunkTobeMovedAndMerged.estimatedSizeBytes == kBigChunkMarker ||
+                                    mergeableSibling.estimatedSizeBytes == kBigChunkMarker)
+            ? kBigChunkMarker
+            : chunkTobeMovedAndMerged.estimatedSizeBytes + mergeableSibling.estimatedSizeBytes;
         if (estimatedMergedSize > _smallChunkSizeThresholdBytes) {
             ranking += mergeableSibling.estimatedSizeBytes < _smallChunkSizeThresholdBytes
                 ? kMergeSolvesTwoPendingChunks
@@ -1080,7 +1127,7 @@ public:
     }
 
     boost::optional<MigrateInfo> popNextMigration(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) override {
+        OperationContext* opCtx, stdx::unordered_set<ShardId>* availableShards) override {
         return boost::none;
     }
 
@@ -1265,7 +1312,7 @@ public:
     }
 
     boost::optional<MigrateInfo> popNextMigration(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) override {
+        OperationContext* opCtx, stdx::unordered_set<ShardId>* availableShards) override {
         return boost::none;
     }
 
@@ -1392,13 +1439,26 @@ private:
 
 }  // namespace
 
-void BalancerDefragmentationPolicyImpl::startCollectionDefragmentation(OperationContext* opCtx,
-                                                                       const CollectionType& coll) {
-    {
-        stdx::lock_guard<Latch> lk(_stateMutex);
-        const auto& uuid = coll.getUuid();
-        if (!coll.getDefragmentCollection() || _defragmentationStates.contains(uuid)) {
-            return;
+void BalancerDefragmentationPolicyImpl::startCollectionDefragmentations(OperationContext* opCtx) {
+    stdx::lock_guard<Latch> lk(_stateMutex);
+
+    // Fetch all collections with `defragmentCollection` flag enabled
+    static const auto query = BSON(CollectionType::kDefragmentCollectionFieldName << true);
+    auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+    const auto& collDocs = uassertStatusOK(configShard->exhaustiveFindOnConfig(
+                                               opCtx,
+                                               ReadPreferenceSetting(ReadPreference::Nearest),
+                                               repl::ReadConcernLevel::kMajorityReadConcern,
+                                               NamespaceString::kConfigsvrCollectionsNamespace,
+                                               query,
+                                               BSONObj(),
+                                               boost::none))
+                               .docs;
+
+    for (const BSONObj& obj : collDocs) {
+        const CollectionType coll{obj};
+        if (_defragmentationStates.contains(coll.getUuid())) {
+            continue;
         }
         _initializeCollectionState(lk, opCtx, coll);
     }
@@ -1443,7 +1503,8 @@ BSONObj BalancerDefragmentationPolicyImpl::reportProgressOn(const UUID& uuid) {
 }
 
 MigrateInfoVector BalancerDefragmentationPolicyImpl::selectChunksToMove(
-    OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) {
+    OperationContext* opCtx, stdx::unordered_set<ShardId>* availableShards) {
+
     MigrateInfoVector chunksToMove;
     {
         stdx::lock_guard<Latch> lk(_stateMutex);
@@ -1470,6 +1531,10 @@ MigrateInfoVector BalancerDefragmentationPolicyImpl::selectChunksToMove(
             for (auto it = collectionUUIDs.begin(); it != collectionUUIDs.end();) {
                 const auto& collUUID = *it;
 
+                if (availableShards->size() == 0) {
+                    return chunksToMove;
+                }
+
                 try {
                     auto defragStateIt = _defragmentationStates.find(collUUID);
                     if (defragStateIt == _defragmentationStates.end()) {
@@ -1484,7 +1549,7 @@ MigrateInfoVector BalancerDefragmentationPolicyImpl::selectChunksToMove(
                         continue;
                     }
                     auto actionableMigration =
-                        collDefragmentationPhase->popNextMigration(opCtx, usedShards);
+                        collDefragmentationPhase->popNextMigration(opCtx, availableShards);
                     if (!actionableMigration.has_value()) {
                         it = popCollectionUUID(it);
                         continue;
@@ -1505,7 +1570,7 @@ MigrateInfoVector BalancerDefragmentationPolicyImpl::selectChunksToMove(
         }
     }
 
-    if (chunksToMove.empty() && usedShards->empty()) {
+    if (chunksToMove.empty()) {
         // If the policy cannot produce new migrations even in absence of temporary constraints, it
         // is possible that some streaming actions must be processed first. Notify an update of the
         // internal state to make it happen.

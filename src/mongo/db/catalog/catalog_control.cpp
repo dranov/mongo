@@ -35,6 +35,7 @@
 
 #include "mongo/db/catalog/catalog_control.h"
 
+#include "mongo/db/catalog/catalog_stats.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
@@ -43,17 +44,18 @@
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/rebuild_indexes.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/tenant_database_name.h"
+#include "mongo/db/timeseries/timeseries_extended_range.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace catalog {
 namespace {
-void reopenAllDatabasesAndReloadCollectionCatalog(
-    OperationContext* opCtx,
-    StorageEngine* storageEngine,
-    const MinVisibleTimestampMap& minVisibleTimestampMap,
-    Timestamp stableTimestamp) {
+void reopenAllDatabasesAndReloadCollectionCatalog(OperationContext* opCtx,
+                                                  StorageEngine* storageEngine,
+                                                  const PreviousCatalogState& previousCatalogState,
+                                                  Timestamp stableTimestamp) {
 
     // Open all databases and repopulate the CollectionCatalog.
     LOGV2(20276, "openCatalog: reopening all databases");
@@ -80,7 +82,7 @@ void reopenAllDatabasesAndReloadCollectionCatalog(
                       str::stream()
                           << "failed to get valid collection pointer for namespace " << collNss);
 
-            if (minVisibleTimestampMap.count(collection->uuid()) > 0) {
+            if (previousCatalogState.minVisibleTimestampMap.count(collection->uuid()) > 0) {
                 // After rolling back to a stable timestamp T, the minimum visible timestamp for
                 // each collection must be reset to (at least) its value at T. Additionally, there
                 // cannot exist a minimum visible timestamp greater than lastApplied. This allows us
@@ -90,12 +92,29 @@ void reopenAllDatabasesAndReloadCollectionCatalog(
                 // bound the minimum visible timestamp (where necessary) to the stable timestamp.
                 // The benefit of fine grained tracking is assumed to be low-value compared to the
                 // cost/effort.
-                auto minVisible = std::min(stableTimestamp,
-                                           minVisibleTimestampMap.find(collection->uuid())->second);
+                auto minVisible = std::min(
+                    stableTimestamp,
+                    previousCatalogState.minVisibleTimestampMap.find(collection->uuid())->second);
                 auto writableCollection =
                     catalogWriter.get()->lookupCollectionByUUIDForMetadataWrite(opCtx,
                                                                                 collection->uuid());
                 writableCollection->setMinimumVisibleSnapshot(minVisible);
+            }
+
+            if (collection->getTimeseriesOptions()) {
+                bool extendedRangeSetting;
+                if (auto it = previousCatalogState.requiresTimestampExtendedRangeSupportMap.find(
+                        collection->uuid());
+                    it != previousCatalogState.requiresTimestampExtendedRangeSupportMap.end()) {
+                    extendedRangeSetting = it->second;
+                } else {
+                    extendedRangeSetting =
+                        timeseries::collectionMayRequireExtendedRangeSupport(opCtx, collection);
+                }
+
+                if (extendedRangeSetting) {
+                    collection->setRequiresTimeseriesExtendedRangeSupport(opCtx);
+                }
             }
 
             // If this is the oplog collection, re-establish the replication system's cached pointer
@@ -114,19 +133,18 @@ void reopenAllDatabasesAndReloadCollectionCatalog(
 
     // Opening CollectionCatalog: The collection catalog is now in sync with the storage engine
     // catalog. Clear the pre-closing state.
-    CollectionCatalog::write(opCtx,
-                             [&](CollectionCatalog& catalog) { catalog.onOpenCatalog(opCtx); });
+    CollectionCatalog::write(opCtx, [](CollectionCatalog& catalog) { catalog.onOpenCatalog(); });
     opCtx->getServiceContext()->incrementCatalogGeneration();
     LOGV2(20278, "openCatalog: finished reloading collection catalog");
 }
 }  // namespace
 
-MinVisibleTimestampMap closeCatalog(OperationContext* opCtx) {
+PreviousCatalogState closeCatalog(OperationContext* opCtx) {
     invariant(opCtx->lockState()->isW());
 
     IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgress();
 
-    MinVisibleTimestampMap minVisibleTimestampMap;
+    PreviousCatalogState previousCatalogState;
     std::vector<TenantDatabaseName> allDbs =
         opCtx->getServiceContext()->getStorageEngine()->listDatabases();
 
@@ -150,7 +168,12 @@ MinVisibleTimestampMap closeCatalog(OperationContext* opCtx) {
                             "coll_ns"_attr = coll->ns(),
                             "uuid"_attr = coll->uuid(),
                             "minVisible"_attr = minVisible);
-                minVisibleTimestampMap[coll->uuid()] = *minVisible;
+                previousCatalogState.minVisibleTimestampMap[coll->uuid()] = *minVisible;
+            }
+
+            if (coll->getTimeseriesOptions()) {
+                previousCatalogState.requiresTimestampExtendedRangeSupportMap[coll->uuid()] =
+                    coll->getRequiresTimeseriesExtendedRangeSupport();
             }
         }
     }
@@ -158,14 +181,13 @@ MinVisibleTimestampMap closeCatalog(OperationContext* opCtx) {
     // Need to mark the CollectionCatalog as open if we our closeAll fails, dismissed if successful.
     ScopeGuard reopenOnFailure([opCtx] {
         CollectionCatalog::write(opCtx,
-                                 [&](CollectionCatalog& catalog) { catalog.onOpenCatalog(opCtx); });
+                                 [](CollectionCatalog& catalog) { catalog.onOpenCatalog(); });
     });
     // Closing CollectionCatalog: only lookupNSSByUUID will fall back to using pre-closing state to
     // allow authorization for currently unknown UUIDs. This is needed because authorization needs
     // to work before acquiring locks, and might otherwise spuriously regard a UUID as unknown
     // while reloading the catalog.
-    CollectionCatalog::write(opCtx,
-                             [&](CollectionCatalog& catalog) { catalog.onCloseCatalog(opCtx); });
+    CollectionCatalog::write(opCtx, [](CollectionCatalog& catalog) { catalog.onCloseCatalog(); });
 
     LOGV2_DEBUG(20270, 1, "closeCatalog: closing collection catalog");
 
@@ -177,12 +199,16 @@ MinVisibleTimestampMap closeCatalog(OperationContext* opCtx) {
     LOGV2(20272, "closeCatalog: closing storage engine catalog");
     opCtx->getServiceContext()->getStorageEngine()->closeCatalog(opCtx);
 
+    // Reset the stats counter for extended range time-series collections. This is maintained
+    // outside the catalog itself.
+    catalog_stats::requiresTimeseriesExtendedRangeSupport.store(0);
+
     reopenOnFailure.dismiss();
-    return minVisibleTimestampMap;
+    return previousCatalogState;
 }
 
 void openCatalog(OperationContext* opCtx,
-                 const MinVisibleTimestampMap& minVisibleTimestampMap,
+                 const PreviousCatalogState& previousCatalogState,
                  Timestamp stableTimestamp) {
     invariant(opCtx->lockState()->isW());
 
@@ -254,7 +280,7 @@ void openCatalog(OperationContext* opCtx,
         opCtx, reconcileResult.indexBuildsToRestart, reconcileResult.indexBuildsToResume);
 
     reopenAllDatabasesAndReloadCollectionCatalog(
-        opCtx, storageEngine, minVisibleTimestampMap, stableTimestamp);
+        opCtx, storageEngine, previousCatalogState, stableTimestamp);
 }
 
 

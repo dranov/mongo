@@ -42,7 +42,7 @@
 #include "mongo/db/catalog/collection_catalog_helper.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/namespace_string.h"
@@ -521,14 +521,27 @@ void resubmitRangeDeletionsOnStepUp(ServiceContext* serviceContext) {
             FindCommandRequest findCommand(NamespaceString::kRangeDeletionNamespace);
             findCommand.setFilter(BSON(RangeDeletionTask::kProcessingFieldName << true));
             auto cursor = client.find(std::move(findCommand));
-            if (cursor->more()) {
-                return migrationutil::submitRangeDeletionTask(
+
+            auto retFuture = ExecutorFuture<void>(getMigrationUtilExecutor(serviceContext));
+
+            int rangeDeletionsMarkedAsProcessing = 0;
+            while (cursor->more()) {
+                retFuture = migrationutil::submitRangeDeletionTask(
                     opCtx.get(),
                     RangeDeletionTask::parse(IDLParserErrorContext("rangeDeletionRecovery"),
                                              cursor->next()));
-            } else {
-                return ExecutorFuture<void>(getMigrationUtilExecutor(serviceContext));
+                rangeDeletionsMarkedAsProcessing++;
             }
+
+            if (rangeDeletionsMarkedAsProcessing > 1) {
+                LOGV2_WARNING(
+                    6695800,
+                    "Rescheduling several range deletions marked as processing. Orphans count "
+                    "may be off while they are not drained",
+                    "numRangeDeletionsMarkedAsProcessing"_attr = rangeDeletionsMarkedAsProcessing);
+            }
+
+            return retFuture;
         })
         .then([serviceContext] {
             ThreadClient tc("ResubmitRangeDeletions", serviceContext);
@@ -706,8 +719,8 @@ void persistUpdatedNumOrphans(OperationContext* opCtx,
                                << BSON("$exists" << true));
     try {
         PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-        ScopedRangeDeleterLock rangeDeleterLock(opCtx, collectionUuid);
-        // TODO (SERVER-54284) Remove writeConflictRetry loop
+        ScopedRangeDeleterLock rangeDeleterLock(opCtx, MODE_IX);
+        // TODO (SERVER-65996) Remove writeConflictRetry loop
         writeConflictRetry(
             opCtx, "updateOrphanCount", NamespaceString::kRangeDeletionNamespace.ns(), [&] {
                 store.update(opCtx,
@@ -986,11 +999,6 @@ void markAsReadyRangeDeletionTaskLocally(OperationContext* opCtx, const UUID& mi
 }
 
 void deleteMigrationCoordinatorDocumentLocally(OperationContext* opCtx, const UUID& migrationId) {
-    // Before deleting the migration coordinator document, ensure that in the case of a crash, the
-    // node will start-up from at least the configTime, which it obtained as part of recovery of the
-    // shardVersion, which will ensure that it will see at least the same shardVersion.
-    VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
-
     PersistentTaskStore<MigrationCoordinatorDocument> store(
         NamespaceString::kMigrationCoordinatorsNamespace);
     store.remove(opCtx,
@@ -1126,7 +1134,7 @@ void recoverMigrationCoordinations(OperationContext* opCtx,
                 hangInRefreshFilteringMetadataUntilSuccessThenSimulateErrorUninterruptible
                     .pauseWhileSet();
                 uasserted(ErrorCodes::InternalError,
-                          "simulate an error response for forceShardFilteringMetadataRefresh");
+                          "simulate an error response for forceGetCurrentMetadata");
             }
 
             auto setFilteringMetadata = [&opCtx, &currentMetadata, &doc, &cancellationToken]() {
@@ -1165,6 +1173,15 @@ void recoverMigrationCoordinations(OperationContext* opCtx,
                               currentMetadata.getChunkManager()->getUUID(),
                           "coordinatorDocumentUUID"_attr = doc.getCollectionUuid());
                 }
+
+                // TODO SERVER-71918 once the drop collection coordinator starts persisting the
+                // config time we can remove this. Since the collection has been dropped,
+                // persist config time inclusive of the drop collection event before deleting
+                // leftover migration metadata.
+                // This will ensure that in case of stepdown the new
+                // primary won't read stale data from config server and think that the sharded
+                // collection still exists.
+                VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
 
                 deleteRangeDeletionTaskOnRecipient(opCtx, doc.getRecipientShardId(), doc.getId());
                 deleteRangeDeletionTaskLocally(opCtx, doc.getId());
@@ -1298,10 +1315,15 @@ void resumeMigrationRecipientsOnStepUp(OperationContext* opCtx) {
             const auto& nss = doc.getNss();
 
             // Register this receiveChunk on the ActiveMigrationsRegistry before completing step-up
-            // to prevent a new migration from starting while a receiveChunk was ongoing.
+            // to prevent a new migration from starting while a receiveChunk was ongoing. Wait for
+            // any migrations that began in a previous term to complete if there are any.
             auto scopedReceiveChunk(
                 uassertStatusOK(ActiveMigrationsRegistry::get(opCtx).registerReceiveChunk(
-                    opCtx, nss, doc.getRange(), doc.getDonorShardIdForLoggingPurposesOnly())));
+                    opCtx,
+                    nss,
+                    doc.getRange(),
+                    doc.getDonorShardIdForLoggingPurposesOnly(),
+                    true /* waitForOngoingMigrations */)));
 
             const auto mdm = MigrationDestinationManager::get(opCtx);
             uassertStatusOK(

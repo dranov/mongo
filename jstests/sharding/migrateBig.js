@@ -1,7 +1,10 @@
 (function() {
 'use strict';
 
-var s = new ShardingTest({name: "migrateBig", shards: 2, other: {chunkSize: 1}});
+load("jstests/libs/feature_flag_util.js");
+
+var s = new ShardingTest(
+    {name: "migrateBig", shards: 2, other: {chunkSize: 1, enableAutoSplit: false}});
 
 assert.commandWorked(
     s.config.settings.update({_id: "balancer"}, {$set: {_waitForDelete: true}}, true));
@@ -58,11 +61,7 @@ s.printShardingStatus();
 
 s.startBalancer();
 
-assert.soon(function() {
-    var x = s.chunkDiff("foo", "test");
-    print("chunk diff: " + x);
-    return x < 2;
-}, "no balance happened", 8 * 60 * 1000, 2000);
+s.awaitBalance('foo', 'test', 60 * 1000);
 
 s.stop();
 })();

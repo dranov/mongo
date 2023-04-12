@@ -239,6 +239,9 @@ public:
      */
     StatusWith<std::shared_ptr<Shard>> getShard(OperationContext* opCtx, const ShardId& shardId);
 
+    SemiFuture<std::shared_ptr<Shard>> getShard(ExecutorPtr executor,
+                                                const ShardId& shardId) noexcept;
+
     /**
      * Returns a vector containing all known shard IDs.
      * The order of the elements is not guaranteed.
@@ -272,7 +275,7 @@ public:
      * The ShardRegistry is "up" once a successful lookup from the config servers has been
      * completed.
      */
-    bool isUp() const;
+    bool isUp();
 
     void toBSON(BSONObjBuilder* result) const;
 
@@ -438,7 +441,8 @@ private:
 
     void _initializeCacheIfNecessary() const;
 
-    SharedSemiFuture<Cache::ValueHandle> _reloadInternal();
+    SharedSemiFuture<Cache::ValueHandle> _reloadAsync();
+    SharedSemiFuture<Cache::ValueHandle> _reloadAsyncNoRetry();
 
     /**
      * Factory to create shards.  Never changed after startup so safe to access outside of _mutex.

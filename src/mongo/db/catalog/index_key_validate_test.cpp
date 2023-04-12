@@ -318,5 +318,63 @@ TEST(IndexKeyValidateTest, Background) {
         nullptr, fromjson("{key: {a: 1}, name: 'index', background: []}")));
 }
 
+TEST(IndexKeyValidateTest, RemoveUnkownFieldsFromIndexSpecs) {
+    ASSERT(fromjson("{key: {a: 1}, name: 'index'}")
+               .binaryEqual(index_key_validate::removeUnknownFields(
+                   NamespaceString("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', safe: true, force: true}"))));
+}
+
+TEST(IndexKeyValidateTest, UpdateTTLIndexNaNExpireAfterSeconds) {
+    ASSERT(BSON("key" << BSON("a" << 1) << "name"
+                      << "index"
+                      << "expireAfterSeconds" << std::numeric_limits<int32_t>::max()
+                      << IndexDescriptor::kIndexVersionFieldName << IndexVersion::kV2)
+               .binaryEqual(unittest::assertGet(index_key_validate::validateIndexSpec(
+                   nullptr, fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: NaN}")))));
+}
+
+TEST(IndexKeyValidateTest, RepairIndexSpecs) {
+    ASSERT(fromjson("{key: {a: 1}, name: 'index'}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', safe: true, force: true}"))));
+
+    ASSERT(fromjson("{key: {a: 1}, name: 'index', sparse: true}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', sparse: 'true'}"))));
+
+    ASSERT(fromjson("{key: {a: 1}, name: 'index', background: true}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', background: '1'}"))));
+
+    ASSERT(fromjson("{key: {a: 1}, name: 'index', sparse: true, background: true}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', sparse: 'true', background: '1'}"))));
+
+    ASSERT(fromjson("{key: {a: 1}, name: 'index', sparse: true, background: true}")
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', sparse: 'true', background: '1', safe: "
+                            "true, force: true}"))));
+
+    ASSERT(BSON("key" << BSON("a" << 1) << "name"
+                      << "index"
+                      << "expireAfterSeconds" << std::numeric_limits<int32_t>::max())
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: NaN}"))));
+
+    ASSERT(BSON("key" << BSON("a" << 1) << "name"
+                      << "index"
+                      << "expireAfterSeconds" << std::numeric_limits<int32_t>::max())
+               .binaryEqual(index_key_validate::repairIndexSpec(
+                   NamespaceString("coll"),
+                   fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: '123'}"))));
+}
+
 }  // namespace
 }  // namespace mongo

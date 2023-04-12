@@ -40,6 +40,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/sorter/sorter.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/yieldable.h"
 
@@ -71,6 +72,9 @@ public:
 
     IndexAccessMethod() = default;
     virtual ~IndexAccessMethod() = default;
+
+    static std::unique_ptr<IndexAccessMethod> make(
+        IndexCatalogEntry* entry, std::unique_ptr<SortedDataInterface> sortedDataInterface);
 
     /**
      * Equivalent to (but shorter and faster than): dynamic_cast<SortedDataIndexAccessMethod*>(this)
@@ -185,7 +189,6 @@ public:
          */
         virtual Status insert(OperationContext* opCtx,
                               const CollectionPtr& collection,
-                              SharedBufferFragmentBuilder& pooledBuilder,
                               const BSONObj& obj,
                               const RecordId& loc,
                               const InsertDeleteOptions& options,
@@ -218,6 +221,12 @@ public:
          * Persists on disk the keys that have been inserted using this BulkBuilder.
          */
         virtual IndexStateInfo persistDataForShutdown() = 0;
+
+    protected:
+        static void countNewBuildInStats();
+        static void countResumedBuildInStats();
+        static SorterFileStats* bulkBuilderFileStats();
+        static SorterTracker* bulkBuilderTracker();
     };
 
     /**
@@ -237,23 +246,6 @@ public:
         size_t maxMemoryUsageBytes,
         const boost::optional<IndexStateInfo>& stateInfo,
         StringData dbName) = 0;
-};
-
-/**
- * Factory class that constructs an IndexAccessMethod depending on the type of index.
- */
-class IndexAccessMethodFactory {
-public:
-    IndexAccessMethodFactory() = default;
-    virtual ~IndexAccessMethodFactory() = default;
-
-    static IndexAccessMethodFactory* get(ServiceContext* service);
-    static IndexAccessMethodFactory* get(OperationContext* opCtx);
-    static void set(ServiceContext* service,
-                    std::unique_ptr<IndexAccessMethodFactory> collectionFactory);
-
-    virtual std::unique_ptr<IndexAccessMethod> make(
-        IndexCatalogEntry* entry, std::unique_ptr<SortedDataInterface> sortedDataInterface) = 0;
 };
 
 /**

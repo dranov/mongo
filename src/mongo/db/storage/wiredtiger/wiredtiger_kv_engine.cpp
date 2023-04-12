@@ -472,6 +472,12 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         ss << WiredTigerUtil::generateRestoreConfig() << ",";
     }
 
+    // If we've requested an ephemeral instance we store everything into memory instead of backing
+    // it onto disk. Logging is not supported in this instance, thus we also have to disable it.
+    if (_ephemeral) {
+        ss << "in_memory=true,log=(enabled=false),";
+    }
+
     string config = ss.str();
     LOGV2(22315, "Opening WiredTiger", "config"_attr = config);
     auto startTime = Date_t::now();
@@ -719,7 +725,6 @@ void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::str
 
 void WiredTigerKVEngine::cleanShutdown() {
     LOGV2(22317, "WiredTigerKVEngine shutting down");
-    WiredTigerUtil::resetTableLoggingInfo();
 
     if (!_conn) {
         return;
@@ -2004,6 +2009,11 @@ bool WiredTigerKVEngine::supportsDirectoryPerDB() const {
 }
 
 void WiredTigerKVEngine::_checkpoint(WT_SESSION* session) {
+    // Ephemeral WiredTiger instances cannot do a checkpoint to disk as there is no disk backing
+    // the data.
+    if (_ephemeral) {
+        return;
+    }
     // TODO: SERVER-64507: Investigate whether we can smartly rely on one checkpointer if two or
     // more threads checkpoint at the same time.
     stdx::lock_guard lk(_checkpointMutex);
@@ -2744,6 +2754,40 @@ void WiredTigerKVEngine::dump() const {
 Status WiredTigerKVEngine::reconfigureLogging() {
     auto verboseConfig = WiredTigerUtil::generateWTVerboseConfiguration();
     return wtRCToStatus(_conn->reconfigure(_conn, verboseConfig.c_str()), nullptr);
+}
+
+KeyFormat WiredTigerKVEngine::getKeyFormat(OperationContext* opCtx, StringData ident) const {
+
+    const std::string wtTableConfig =
+        uassertStatusOK(WiredTigerUtil::getMetadataCreate(opCtx, "table:{}"_format(ident)));
+    return wtTableConfig.find("key_format=u") != string::npos ? KeyFormat::String : KeyFormat::Long;
+}
+
+StatusWith<BSONObj> WiredTigerKVEngine::getSanitizedStorageOptionsForSecondaryReplication(
+    const BSONObj& options) const {
+
+    // Skip inMemory storage engine, encryption at rest only applies to storage backed engine.
+    if (_ephemeral || options.isEmpty()) {
+        return options;
+    }
+
+    auto firstElem = options.firstElement();
+    if (firstElem.fieldName() != kWiredTigerEngineName) {
+        return Status(ErrorCodes::InvalidOptions,
+                      str::stream() << "Expected \"" << kWiredTigerEngineName
+                                    << "\" field, but got: " << firstElem.fieldName());
+    }
+
+    BSONObj wtObj = firstElem.Obj();
+    if (auto configStringElem = wtObj.getField(WiredTigerUtil::kConfigStringField)) {
+        auto configString = configStringElem.String();
+        WiredTigerUtil::removeEncryptionFromConfigString(&configString);
+        // Return a new BSONObj with the configString field sanitized.
+        return options.addFields(BSON(kWiredTigerEngineName << wtObj.addFields(BSON(
+                                          WiredTigerUtil::kConfigStringField << configString))));
+    }
+
+    return options;
 }
 
 }  // namespace mongo

@@ -104,6 +104,17 @@ void shardedRenameMetadata(OperationContext* opCtx,
                            const WriteConcernOptions& writeConcern);
 
 /**
+ * Ensure source collection uuid is consistent on every shard
+ * Ensure target collection is not present on any shard when `dropTarget` is false
+ */
+void checkCatalogConsistencyAcrossShardsForRename(
+    OperationContext* opCtx,
+    const NamespaceString& fromNss,
+    const NamespaceString& toNss,
+    bool dropTarget,
+    std::shared_ptr<executor::ScopedTaskExecutor> executor);
+
+/**
  * Ensures rename preconditions for collections are met:
  * - Check that the namespace of the destination collection is not too long
  * - Check that `dropTarget` is true if the destination collection exists
@@ -155,6 +166,12 @@ void resumeMigrations(OperationContext* opCtx,
                       const NamespaceString& nss,
                       const boost::optional<UUID>& expectedCollectionUUID);
 
+/**
+ * Calls to the config server primary to get the collection document for the given nss.
+ * Returns the value of the allowMigrations flag on the collection document.
+ */
+bool checkAllowMigrations(OperationContext* opCtx, const NamespaceString& nss);
+
 /*
  * Returns the UUID of the collection (if exists) using the catalog. It does not provide any locking
  * guarantees after the call.
@@ -185,7 +202,21 @@ void sendDropCollectionParticipantCommandToShards(OperationContext* opCtx,
                                                   const NamespaceString& nss,
                                                   const std::vector<ShardId>& shardIds,
                                                   std::shared_ptr<executor::TaskExecutor> executor,
-                                                  const OperationSessionInfo& osi);
+                                                  const OperationSessionInfo& osi,
+                                                  bool fromMigrate);
+
+BSONObj getCriticalSectionReasonForRename(const NamespaceString& from, const NamespaceString& to);
+
+/**
+ * Drops the specified collection or returns without error if the collection has already been
+ * dropped. A particular incarnation of the collection can be dropped by specifying its UUID.
+ *
+ * This functions assumes the collection being dropped doesn't have any two-phase index builds
+ * active on it.
+ */
+void ensureCollectionDroppedNoChangeEvent(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          const boost::optional<UUID>& uuid = boost::none);
 
 }  // namespace sharding_ddl_util
 }  // namespace mongo

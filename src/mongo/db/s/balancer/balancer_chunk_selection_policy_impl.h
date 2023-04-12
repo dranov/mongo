@@ -47,7 +47,9 @@ public:
                                                     const NamespaceString& ns) override;
 
     StatusWith<MigrateInfoVector> selectChunksToMove(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) override;
+        OperationContext* opCtx,
+        const std::vector<ClusterStatistics::ShardStatistics>& shardStats,
+        stdx::unordered_set<ShardId>* availableShards) override;
 
     StatusWith<MigrateInfosWithReason> selectChunksToMove(OperationContext* opCtx,
                                                           const NamespaceString& ns) override;
@@ -77,7 +79,8 @@ private:
         OperationContext* opCtx,
         const NamespaceString& nss,
         const ShardStatisticsVector& shardStats,
-        stdx::unordered_set<ShardId>* usedShards);
+        const boost::optional<CollectionDataSizeInfoForBalancing>& collDataSizeInfo,
+        stdx::unordered_set<ShardId>* availableShards);
 
     // Source for obtaining cluster statistics. Not owned and must not be destroyed before the
     // policy object is destroyed.

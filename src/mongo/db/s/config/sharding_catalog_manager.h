@@ -271,8 +271,7 @@ public:
                                           const boost::optional<Timestamp>& timestamp,
                                           const UUID& requestCollectionUUID,
                                           const ChunkRange& chunkRange,
-                                          const ShardId& shardId,
-                                          const boost::optional<Timestamp>& validAfter);
+                                          const ShardId& shardId);
 
     /**
      * Updates metadata in config.chunks collection to show the given chunk in its new shard.
@@ -348,7 +347,8 @@ public:
      */
     void splitOrMarkJumbo(OperationContext* opCtx,
                           const NamespaceString& nss,
-                          const BSONObj& minKey);
+                          const BSONObj& minKey,
+                          boost::optional<int64_t> optMaxChunkSizeBytes);
 
     /**
      * In a transaction, sets the 'allowMigrations' to the requested state and bumps the collection
@@ -395,6 +395,15 @@ public:
         const boost::optional<ShardId>& optPrimaryShard,
         // # TODO SERVER-63983: remove enableSharding paramter when 6.0 becomes lastLTS
         bool enableSharding = false);
+
+    /**
+     * Updates the metadata in config.databases collection with the new primary shard for the given
+     * database. This also advances the database's lastmod.
+     */
+    void commitMovePrimary(OperationContext* opCtx,
+                           const StringData& dbName,
+                           const DatabaseVersion& expectedDbVersion,
+                           const ShardId& toShardId);
 
     //
     // Collection Operations
@@ -663,6 +672,18 @@ private:
      * the config server in the newly added shard.
      */
     void _standardizeClusterParameters(OperationContext* opCtx, RemoteCommandTargeter* targeter);
+
+    /**
+     * Execute the merge chunk updates using the internal transaction API.
+     */
+    void _mergeChunksInTransaction(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   const UUID& collectionUUID,
+                                   const ChunkVersion& mergeVersion,
+                                   const Timestamp& validAfter,
+                                   const ChunkRange& chunkRange,
+                                   const ShardId& shardId,
+                                   std::shared_ptr<std::vector<ChunkType>> chunksToMerge);
 
     // The owning service context
     ServiceContext* const _serviceContext;

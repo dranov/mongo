@@ -94,6 +94,9 @@ static constexpr StringData kBalancerPolicyStatusZoneViolation = "zoneViolation"
 static constexpr StringData kBalancerPolicyStatusChunksImbalance = "chunksImbalance"_sd;
 static constexpr StringData kBalancerPolicyStatusDefragmentingChunks = "defragmentingChunks"_sd;
 
+// Time interval between checks on draining shards.
+constexpr Minutes kDrainingShardsCheckInterval{10};
+
 /**
  * Utility class to generate timing and statistics for a single balancer round.
  */
@@ -228,6 +231,36 @@ std::tuple<bool, WriteConcernOptions> getSecondaryThrottleAndWriteConcern(
 const auto _balancerDecoration = ServiceContext::declareDecoration<Balancer>();
 
 const ReplicaSetAwareServiceRegistry::Registerer<Balancer> _balancerRegisterer("Balancer");
+
+/**
+ * Returns the names of shards that are currently draining. When the balancer is disabled, draining
+ * shards are stuck in this state as chunks cannot be migrated.
+ */
+std::vector<std::string> getDrainingShardNames(OperationContext* opCtx) {
+    // Find the shards that are currently draining.
+    const auto configShard{Grid::get(opCtx)->shardRegistry()->getConfigShard()};
+    const auto drainingShardsDocs{
+        uassertStatusOK(
+            configShard->exhaustiveFindOnConfig(opCtx,
+                                                ReadPreferenceSetting{ReadPreference::Nearest},
+                                                repl::ReadConcernLevel::kMajorityReadConcern,
+                                                NamespaceString::kConfigsvrShardsNamespace,
+                                                BSON(ShardType::draining << true),
+                                                BSONObj() /* No sorting */,
+                                                boost::none /* No limit */))
+            .docs};
+
+    // Build the list of the draining shard names.
+    std::vector<std::string> drainingShardNames;
+    std::transform(drainingShardsDocs.begin(),
+                   drainingShardsDocs.end(),
+                   std::back_inserter(drainingShardNames),
+                   [](const auto& shardDoc) {
+                       const auto shardEntry{uassertStatusOK(ShardType::fromBSON(shardDoc))};
+                       return shardEntry.getName();
+                   });
+    return drainingShardNames;
+}
 
 }  // namespace
 
@@ -434,6 +467,7 @@ void Balancer::report(OperationContext* opCtx, BSONObjBuilder* builder) {
     builder->append("mode", BalancerSettingsType::kBalancerModes[mode]);
     builder->append("inBalancerRound", _inBalancerRound);
     builder->append("numBalancerRounds", _numBalancerRounds);
+    builder->append("term", repl::ReplicationCoordinator::get(opCtx)->getTerm());
 }
 
 void Balancer::_consumeActionStreamLoop() {
@@ -550,7 +584,8 @@ void Balancer::_consumeActionStreamLoop() {
                                               dataSizeAction.chunkRange,
                                               dataSizeAction.version,
                                               dataSizeAction.keyPattern,
-                                              dataSizeAction.estimatedValue)
+                                              dataSizeAction.estimatedValue,
+                                              dataSizeAction.maxSize)
                             .thenRunOn(*executor)
                             .onCompletion([this,
                                            selectedStream,
@@ -662,6 +697,7 @@ void Balancer::_mainThread() {
     LOGV2(6036606, "Balancer worker thread initialised. Entering main loop.");
 
     // Main balancer loop
+    auto lastDrainingShardsCheckTime{Date_t::fromMillisSinceEpoch(0)};
     while (!_stopRequested()) {
         BalanceRoundDetails roundDetails;
 
@@ -684,6 +720,20 @@ void Balancer::_mainThread() {
 
             if (!balancerConfig->shouldBalance() || _stopRequested() ||
                 _clusterChunksResizePolicy->isActive()) {
+
+                if (balancerConfig->getBalancerMode() == BalancerSettingsType::BalancerMode::kOff &&
+                    Date_t::now() - lastDrainingShardsCheckTime >= kDrainingShardsCheckInterval) {
+                    const auto drainingShardNames{getDrainingShardNames(opCtx.get())};
+                    if (!drainingShardNames.empty()) {
+                        LOGV2_WARNING(6434000,
+                                      "Draining of removed shards cannot be completed because the "
+                                      "balancer is disabled",
+                                      "shards"_attr = drainingShardNames);
+                    }
+
+                    lastDrainingShardsCheckTime = Date_t::now();
+                }
+
                 LOGV2_DEBUG(21859, 1, "Skipping balancing round because balancing is disabled");
                 _endRound(opCtx.get(), kBalanceRoundDefaultInterval);
                 continue;
@@ -708,13 +758,7 @@ void Balancer::_mainThread() {
                 }
 
                 // Collect and apply up-to-date configuration values on the cluster collections.
-                {
-                    OperationContext* ctx = opCtx.get();
-                    auto allCollections = Grid::get(ctx)->catalogClient()->getCollections(ctx, {});
-                    for (const auto& coll : allCollections) {
-                        _defragmentationPolicy->startCollectionDefragmentation(ctx, coll);
-                    }
-                }
+                _defragmentationPolicy->startCollectionDefragmentations(opCtx.get());
 
                 Status status = _splitChunksIfNeeded(opCtx.get());
                 if (!status.isOK()) {
@@ -726,13 +770,24 @@ void Balancer::_mainThread() {
                     LOGV2_DEBUG(21861, 1, "Done enforcing tag range boundaries.");
                 }
 
-                stdx::unordered_set<ShardId> usedShards;
+                const std::vector<ClusterStatistics::ShardStatistics> shardStats =
+                    uassertStatusOK(_clusterStats->getStats(opCtx.get()));
+
+                stdx::unordered_set<ShardId> availableShards;
+                std::transform(
+                    shardStats.begin(),
+                    shardStats.end(),
+                    std::inserter(availableShards, availableShards.end()),
+                    [](const ClusterStatistics::ShardStatistics& shardStatistics) -> ShardId {
+                        return shardStatistics.shardId;
+                    });
 
                 const auto chunksToDefragment =
-                    _defragmentationPolicy->selectChunksToMove(opCtx.get(), &usedShards);
+                    _defragmentationPolicy->selectChunksToMove(opCtx.get(), &availableShards);
 
-                const auto chunksToRebalance = uassertStatusOK(
-                    _chunkSelectionPolicy->selectChunksToMove(opCtx.get(), &usedShards));
+                const auto chunksToRebalance =
+                    uassertStatusOK(_chunkSelectionPolicy->selectChunksToMove(
+                        opCtx.get(), shardStats, &availableShards));
 
                 if (chunksToRebalance.empty() && chunksToDefragment.empty()) {
                     LOGV2_DEBUG(21862, 1, "No need to move any chunk");
@@ -964,13 +1019,17 @@ int Balancer::_moveChunks(OperationContext* opCtx,
     std::vector<std::pair<const MigrateInfo&, SemiFuture<void>>> rebalanceMigrationsAndResponses,
         defragmentationMigrationsAndResponses;
     auto requestMigration = [&](const MigrateInfo& migrateInfo) -> SemiFuture<void> {
-        auto coll = Grid::get(opCtx)->catalogClient()->getCollection(
-            opCtx, migrateInfo.nss, repl::ReadConcernLevel::kMajorityReadConcern);
-        auto maxChunkSizeBytes =
-            coll.getMaxChunkSizeBytes().value_or(balancerConfig->getMaxChunkSizeBytes());
+        auto maxChunkSizeBytes = [&]() {
+            if (migrateInfo.optMaxChunkSizeBytes.has_value()) {
+                return *migrateInfo.optMaxChunkSizeBytes;
+            }
 
-        if (serverGlobalParams.featureCompatibility.isLessThan(
-                multiversion::FeatureCompatibilityVersion::kVersion_6_0)) {
+            auto coll = Grid::get(opCtx)->catalogClient()->getCollection(
+                opCtx, migrateInfo.nss, repl::ReadConcernLevel::kMajorityReadConcern);
+            return coll.getMaxChunkSizeBytes().value_or(balancerConfig->getMaxChunkSizeBytes());
+        }();
+
+        if (migrateInfo.maxKey.has_value()) {
             // TODO SERVER-65322 only use `moveRange` once v6.0 branches out
             MoveChunkSettings settings(maxChunkSizeBytes,
                                        balancerConfig->getSecondaryThrottle(),
@@ -981,18 +1040,24 @@ int Balancer::_moveChunks(OperationContext* opCtx,
         MoveRangeRequestBase requestBase(migrateInfo.to);
         requestBase.setWaitForDelete(balancerConfig->waitForDelete());
         requestBase.setMin(migrateInfo.minKey);
-        if (!feature_flags::gNoMoreAutoSplitter.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
-            // Issue the equivalent of a `moveChunk` if the auto-splitter is enabled
-            requestBase.setMax(migrateInfo.maxKey);
-        }
+        requestBase.setMax(migrateInfo.maxKey);
 
         ShardsvrMoveRange shardSvrRequest(migrateInfo.nss);
         shardSvrRequest.setDbName(NamespaceString::kAdminDb);
         shardSvrRequest.setMoveRangeRequestBase(requestBase);
         shardSvrRequest.setMaxChunkSizeBytes(maxChunkSizeBytes);
         shardSvrRequest.setFromShard(migrateInfo.from);
-        shardSvrRequest.setEpoch(coll.getEpoch());
+        shardSvrRequest.setEpoch(migrateInfo.version.epoch());
+        const auto forceJumbo = [&]() {
+            if (migrateInfo.forceJumbo == MoveChunkRequest::ForceJumbo::kForceManual) {
+                return ForceJumbo::kForceManual;
+            }
+            if (migrateInfo.forceJumbo == MoveChunkRequest::ForceJumbo::kForceBalancer) {
+                return ForceJumbo::kForceBalancer;
+            }
+            return ForceJumbo::kDoNotForce;
+        }();
+        shardSvrRequest.setForceJumbo(forceJumbo);
         const auto [secondaryThrottle, wc] =
             getSecondaryThrottleAndWriteConcern(balancerConfig->getSecondaryThrottle());
         shardSvrRequest.setSecondaryThrottle(secondaryThrottle);
@@ -1036,7 +1101,7 @@ int Balancer::_moveChunks(OperationContext* opCtx,
                 opCtx, migrateInfo.uuid, repl::ReadConcernLevel::kMajorityReadConcern);
 
             ShardingCatalogManager::get(opCtx)->splitOrMarkJumbo(
-                opCtx, collection.getNss(), migrateInfo.minKey);
+                opCtx, collection.getNss(), migrateInfo.minKey, migrateInfo.getMaxChunkSizeBytes());
             continue;
         }
 
@@ -1075,6 +1140,20 @@ void Balancer::abortCollectionDefragmentation(OperationContext* opCtx, const Nam
 
 SharedSemiFuture<void> Balancer::applyLegacyChunkSizeConstraintsOnClusterData(
     OperationContext* opCtx) {
+    // Remove the maxChunkSizeBytes from config.system.collections to make it compatible with
+    // the balancing strategy based on the number of collection chunks
+    try {
+        ShardingCatalogManager::get(opCtx)->configureCollectionBalancing(
+            opCtx,
+            NamespaceString::kLogicalSessionsNamespace,
+            0,
+            boost::none /*defragmentCollection*/,
+            boost::none /*enableAutoSplitter*/);
+    } catch (const ExceptionFor<ErrorCodes::NamespaceNotSharded>&) {
+        // config.system.collections does not appear in config.collections; continue.
+    }
+
+    // Ensure now that each collection in the cluster complies with its "maxChunkSize" constraint
     const auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
     uassertStatusOK(balancerConfig->refreshAndCheck(opCtx));
     auto futureOutcome =
@@ -1095,7 +1174,12 @@ BalancerCollectionStatusResponse Balancer::getBalancerStatusForNs(OperationConte
         uasserted(ErrorCodes::NamespaceNotSharded, "Collection unsharded or undefined");
     }
 
-    const auto maxChunkSizeMB = getMaxChunkSizeMB(opCtx, coll);
+
+    const auto maxChunkSizeBytes = getMaxChunkSizeBytes(opCtx, coll);
+    double maxChunkSizeMB = (double)maxChunkSizeBytes / (1024 * 1024);
+    // Keep only 2 decimal digits to return a readable value
+    maxChunkSizeMB = std::ceil(maxChunkSizeMB * 100.0) / 100.0;
+
     BalancerCollectionStatusResponse response(maxChunkSizeMB, true /*balancerCompliant*/);
     auto setViolationOnResponse = [&response](const StringData& reason,
                                               const boost::optional<BSONObj>& details =

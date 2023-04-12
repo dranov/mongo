@@ -30,15 +30,16 @@ int
 __wt_reconcile(WT_SESSION_IMPL *session, WT_REF *ref, WT_SALVAGE_COOKIE *salvage, uint32_t flags)
 {
     WT_BTREE *btree;
+    WT_CONNECTION_IMPL *conn;
     WT_DECL_RET;
     WT_PAGE *page;
-    uint64_t start, now;
     bool no_reconcile_set, page_locked;
 
     btree = S2BT(session);
+    conn = S2C(session);
     page = ref->page;
 
-    __wt_seconds(session, &start);
+    session->reconcile_timeline.reconcile_start = __wt_clock(session);
 
     __wt_verbose(session, WT_VERB_RECONCILE, "%p reconcile %s (%s%s)", (void *)ref,
       __wt_page_type_string(page->type), LF_ISSET(WT_REC_EVICT) ? "evict" : "checkpoint",
@@ -105,10 +106,25 @@ err:
     if (!no_reconcile_set)
         F_CLR(session, WT_SESSION_NO_RECONCILE);
 
-    /* Track the longest reconciliation, ignoring races (it's just a statistic). */
-    __wt_seconds(session, &now);
-    if (now - start > S2C(session)->rec_maximum_seconds)
-        S2C(session)->rec_maximum_seconds = now - start;
+    /*
+     * Track the longest reconciliation and time spent in each reconciliation stage, ignoring races
+     * (it's just a statistic).
+     */
+    session->reconcile_timeline.reconcile_finish = __wt_clock(session);
+    if (WT_CLOCKDIFF_SEC(session->reconcile_timeline.hs_wrapup_finish,
+          session->reconcile_timeline.hs_wrapup_start) > conn->rec_maximum_hs_wrapup_seconds)
+        conn->rec_maximum_hs_wrapup_seconds =
+          WT_CLOCKDIFF_SEC(session->reconcile_timeline.hs_wrapup_finish,
+            session->reconcile_timeline.hs_wrapup_start);
+    if (WT_CLOCKDIFF_SEC(session->reconcile_timeline.image_build_finish,
+          session->reconcile_timeline.image_build_start) > conn->rec_maximum_image_build_seconds)
+        conn->rec_maximum_image_build_seconds =
+          WT_CLOCKDIFF_SEC(session->reconcile_timeline.image_build_finish,
+            session->reconcile_timeline.image_build_start);
+    if (WT_CLOCKDIFF_SEC(session->reconcile_timeline.reconcile_finish,
+          session->reconcile_timeline.reconcile_start) > conn->rec_maximum_seconds)
+        conn->rec_maximum_seconds = WT_CLOCKDIFF_SEC(session->reconcile_timeline.reconcile_finish,
+          session->reconcile_timeline.reconcile_start);
 
     return (ret);
 }
@@ -236,6 +252,8 @@ __reconcile(WT_SESSION_IMPL *session, WT_REF *ref, WT_SALVAGE_COOKIE *salvage, u
     WT_RET(__rec_init(session, ref, flags, salvage, &session->reconcile));
     r = session->reconcile;
 
+    session->reconcile_timeline.image_build_start = __wt_clock(session);
+
     /* Reconcile the page. */
     switch (page->type) {
     case WT_PAGE_COL_FIX:
@@ -262,6 +280,8 @@ __reconcile(WT_SESSION_IMPL *session, WT_REF *ref, WT_SALVAGE_COOKIE *salvage, u
         ret = __wt_illegal_value(session, page->type);
         break;
     }
+
+    session->reconcile_timeline.image_build_finish = __wt_clock(session);
 
     /*
      * If we failed, don't bail out yet; we still need to update stats and tidy up.
@@ -619,6 +639,9 @@ __rec_init(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags, WT_SALVAGE_COO
     r->supd_next = 0;
     r->supd_memsize = 0;
 
+    /* The list of updates to be deleted from the history store. */
+    r->delete_hs_upd_next = 0;
+
     /* The list of pages we've written. */
     r->multi = NULL;
     r->multi_next = 0;
@@ -771,6 +794,7 @@ __rec_destroy(WT_SESSION_IMPL *session, void *reconcilep)
     __wt_buf_free(session, &r->chunk_B.image);
 
     __wt_free(session, r->supd);
+    __wt_free(session, r->delete_hs_upd);
 
     __wt_rec_dictionary_free(session, r);
 
@@ -2388,6 +2412,7 @@ __rec_write_wrapup(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_PAGE *page)
 {
     WT_BM *bm;
     WT_BTREE *btree;
+    WT_DECL_RET;
     WT_MULTI *multi;
     WT_PAGE_MODIFY *mod;
     WT_REF *ref;
@@ -2405,8 +2430,12 @@ __rec_write_wrapup(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_PAGE *page)
      * visible when reconciling this page, copy them into the database's history store. This can
      * fail, so try before clearing the page's previous reconciliation state.
      */
-    if (F_ISSET(r, WT_REC_HS))
-        WT_RET(__rec_hs_wrapup(session, r));
+    if (F_ISSET(r, WT_REC_HS)) {
+        session->reconcile_timeline.hs_wrapup_start = __wt_clock(session);
+        ret = __rec_hs_wrapup(session, r);
+        session->reconcile_timeline.hs_wrapup_finish = __wt_clock(session);
+        WT_RET(ret);
+    }
 
     /*
      * Wrap up overflow tracking. If we are about to create a checkpoint, the system must be
@@ -2620,6 +2649,12 @@ __rec_hs_wrapup(WT_SESSION_IMPL *session, WT_RECONCILE *r)
     /* Flag as unused for non diagnostic builds. */
     WT_UNUSED(btree);
 
+    /*
+     * Delete the updates left in the history store by prepared rollback first before moving updates
+     * to the history store.
+     */
+    WT_ERR(__wt_hs_delete_updates(session, r));
+
     /* Check if there's work to do. */
     for (multi = r->multi, i = 0; i < r->multi_next; ++multi, ++i)
         if (multi->supd != NULL)
@@ -2750,8 +2785,8 @@ __wt_rec_hs_clear_on_tombstone(WT_SESSION_IMPL *session, WT_RECONCILE *r, wt_tim
      * WT_REC_CHECKPOINT_RUNNING is set only during evictions, and never in the checkpoint thread
      * itself.)
      */
-    WT_RET(__wt_hs_delete_key_from_ts(session, r->hs_cursor, btree->id, key, ts, reinsert, true,
-      F_ISSET(r, WT_REC_CHECKPOINT_RUNNING)));
+    WT_RET(__wt_hs_delete_key_from_ts(
+      session, r->hs_cursor, btree->id, key, ts, reinsert, F_ISSET(r, WT_REC_CHECKPOINT_RUNNING)));
 
     /* Fail 0.01% of the time. */
     if (F_ISSET(r, WT_REC_EVICT) &&

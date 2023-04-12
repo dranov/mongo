@@ -61,6 +61,7 @@
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/collection_uuid_mismatch.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/async_results_merger.h"
 #include "mongo/s/query/cluster_client_cursor_impl.h"
@@ -82,11 +83,6 @@ static const BSONObj kSortKeyMetaProjection = BSON("$meta"
                                                    << "sortKey");
 static const BSONObj kGeoNearDistanceMetaProjection = BSON("$meta"
                                                            << "geoNearDistance");
-// We must allow some amount of overhead per result document, since when we make a cursor response
-// the documents are elements of a BSONArray. The overhead is 1 byte/doc for the type + 1 byte/doc
-// for the field name's null terminator + 1 byte per digit in the array index. The index can be no
-// more than 8 decimal digits since the response is at most 16MB, and 16 * 1024 * 1024 < 1 * 10^8.
-static const int kPerDocumentOverheadBytesUpperBound = 10;
 
 const char kFindCmdName[] = "find";
 
@@ -303,12 +299,9 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
         if (ex.code() == ErrorCodes::CollectionUUIDMismatch &&
             !ex.extraInfo<CollectionUUIDMismatchInfo>()->actualCollection() &&
             !shardIds.count(cm.dbPrimary())) {
-            // We received CollectionUUIDMismatchInfo but it does not contain the actual
-            // namespace, and we did not attempt to establish a cursor on the primary shard.
-            // Attempt to do so now in case the collection corresponding to the provided UUID is
-            // unsharded. This should throw CollectionUUIDMismatchInfo, StaleShardVersion, or
-            // StaleDbVersion.
-            establishCursorsOnShards({cm.dbPrimary()});
+            // We received CollectionUUIDMismatch but it does not contain the actual namespace, and
+            // we did not attempt to establish a cursor on the primary shard.
+            uassertStatusOK(populateCollectionUUIDMismatch(opCtx, ex.toStatus()));
             MONGO_UNREACHABLE;
         }
 
@@ -341,7 +334,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     FindCommon::waitInFindBeforeMakingBatch(opCtx, query);
 
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
-    size_t bytesBuffered = 0;
+    FindCommon::BSONArrayResponseSizeTracker responseSizeTracker;
 
     // This loop will not result in actually calling getMore against shards, but just loading
     // results from the initial batches (that were obtained while establishing cursors) into
@@ -364,14 +357,13 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
 
         // If adding this object will cause us to exceed the message size limit, then we stash it
         // for later.
-        if (!FindCommon::haveSpaceForNext(nextObj, results->size(), bytesBuffered)) {
+        if (!responseSizeTracker.haveSpaceForNext(nextObj)) {
             ccc->queueResult(nextObj);
             break;
         }
 
-        // Add doc to the batch. Account for the space overhead associated with returning this doc
-        // inside a BSON array.
-        bytesBuffered += (nextObj.objsize() + kPerDocumentOverheadBytesUpperBound);
+        // Add doc to the batch.
+        responseSizeTracker.add(nextObj);
         results->push_back(std::move(nextObj));
     }
 
@@ -514,6 +506,13 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
     for (size_t retries = 1; retries <= kMaxRetries; ++retries) {
         auto swCM = getCollectionRoutingInfoForTxnCmd(opCtx, query.nss());
         if (swCM == ErrorCodes::NamespaceNotFound) {
+            uassert(CollectionUUIDMismatchInfo(query.nss().db().toString(),
+                                               *findCommand.getCollectionUUID(),
+                                               query.nss().coll().toString(),
+                                               boost::none),
+                    "Database does not exist",
+                    !findCommand.getCollectionUUID());
+
             // If the database doesn't exist, we successfully return an empty result set without
             // creating a cursor.
             return CursorId(0);
@@ -763,7 +762,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     }
 
     std::vector<BSONObj> batch;
-    size_t bytesBuffered = 0;
+    FindCommon::BSONArrayResponseSizeTracker responseSizeTracker;
     long long batchSize = cmd.getBatchSize().value_or(0);
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
     BSONObj postBatchResumeToken;
@@ -816,8 +815,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
             break;
         }
 
-        if (!FindCommon::haveSpaceForNext(
-                *next.getValue().getResult(), batch.size(), bytesBuffered)) {
+        if (!responseSizeTracker.haveSpaceForNext(*next.getValue().getResult())) {
             pinnedCursor.getValue()->queueResult(*next.getValue().getResult());
             stashedResult = true;
             break;
@@ -826,10 +824,8 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         // As soon as we get a result, this operation no longer waits.
         awaitDataState(opCtx).shouldWaitForInserts = false;
 
-        // Add doc to the batch. Account for the space overhead associated with returning this doc
-        // inside a BSON array.
-        bytesBuffered +=
-            (next.getValue().getResult()->objsize() + kPerDocumentOverheadBytesUpperBound);
+        // Add doc to the batch.
+        responseSizeTracker.add(*next.getValue().getResult());
         batch.push_back(std::move(*next.getValue().getResult()));
 
         // Update the postBatchResumeToken. For non-$changeStream aggregations, this will be empty.

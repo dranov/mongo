@@ -83,6 +83,7 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(WTCompactIndexEBUSY);
 MONGO_FAIL_POINT_DEFINE(WTIndexPauseAfterSearchNear);
+MONGO_FAIL_POINT_DEFINE(WTValidateIndexStructuralDamage);
 
 static const WiredTigerItem emptyItem(nullptr, 0);
 }  // namespace
@@ -102,7 +103,7 @@ void WiredTigerIndex::getKey(OperationContext* opCtx, WT_CURSOR* cursor, WT_ITEM
 StatusWith<std::string> WiredTigerIndex::parseIndexOptions(const BSONObj& options) {
     StringBuilder ss;
     BSONForEach(elem, options) {
-        if (elem.fieldNameStringData() == "configString") {
+        if (elem.fieldNameStringData() == WiredTigerUtil::kConfigStringField) {
             Status status = WiredTigerUtil::checkTableCreationOptions(elem);
             if (!status.isOK()) {
                 return status;
@@ -329,6 +330,15 @@ void WiredTigerIndex::fullValidate(OperationContext* opCtx,
                                    IndexValidateResults* fullResults) const {
     dassert(opCtx->lockState()->isReadLocked());
     if (fullResults && !WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->isEphemeral()) {
+        if (WTValidateIndexStructuralDamage.shouldFail()) {
+            std::string msg = str::stream() << "verify() returned an error. "
+                                            << "This indicates structural damage. "
+                                            << "Not examining individual index entries.";
+            fullResults->errors.push_back(msg);
+            fullResults->valid = false;
+            return;
+        }
+
         int err = WiredTigerUtil::verifyTable(opCtx, _uri, &(fullResults->errors));
         if (err == EBUSY) {
             std::string msg = str::stream()
@@ -356,25 +366,25 @@ void WiredTigerIndex::fullValidate(OperationContext* opCtx,
         }
     }
 
-    auto cursor = newCursor(opCtx);
-    long long count = 0;
-    LOGV2_TRACE_INDEX(20094, "fullValidate");
-
-    const auto requestedInfo = TRACING_ENABLED ? Cursor::kKeyAndLoc : Cursor::kJustExistance;
-
-    KeyString::Value keyStringForSeek =
-        IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(BSONObj(),
-                                                              getKeyStringVersion(),
-                                                              getOrdering(),
-                                                              true, /* forward */
-                                                              true  /* inclusive */
-        );
-
-    for (auto kv = cursor->seek(keyStringForSeek, requestedInfo); kv; kv = cursor->next()) {
-        LOGV2_TRACE_INDEX(20095, "fullValidate {kv}", "kv"_attr = kv);
-        count++;
-    }
     if (numKeysOut) {
+        auto cursor = newCursor(opCtx);
+        long long count = 0;
+        LOGV2_TRACE_INDEX(20094, "fullValidate");
+
+        const auto requestedInfo = TRACING_ENABLED ? Cursor::kKeyAndLoc : Cursor::kJustExistance;
+
+        KeyString::Value keyStringForSeek =
+            IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(BSONObj(),
+                                                                  getKeyStringVersion(),
+                                                                  getOrdering(),
+                                                                  true, /* forward */
+                                                                  true  /* inclusive */
+            );
+
+        for (auto kv = cursor->seek(keyStringForSeek, requestedInfo); kv; kv = cursor->next()) {
+            LOGV2_TRACE_INDEX(20095, "fullValidate {kv}", "kv"_attr = kv);
+            count++;
+        }
         *numKeysOut = count;
     }
 }
@@ -443,6 +453,74 @@ bool WiredTigerIndex::isEmpty(OperationContext* opCtx) {
         return true;
     invariantWTOK(ret, c->session);
     return false;
+}
+
+void WiredTigerIndex::printIndexEntryMetadata(OperationContext* opCtx,
+                                              const KeyString::Value& keyString) const {
+    // Printing the index entry metadata requires a new session. We cannot open other cursors when
+    // there are open history store cursors in the session. We also need to make sure that the
+    // existing session has not written data to avoid potential deadlocks.
+    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    WiredTigerSession session(WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn());
+
+    // Per the version cursor API:
+    // - A version cursor can only be called with the read timestamp as the oldest timestamp.
+    // - If there is no oldest timestamp, the version cursor can only be called with a read
+    //   timestamp of 1.
+    // - If there is an oldest timestamp, reading at timestamp 1 will get rounded up.
+    const std::string config = "read_timestamp=1,roundup_timestamps=(read=true)";
+    WiredTigerBeginTxnBlock beginTxn(session.getSession(), config.c_str());
+
+    // Open a version cursor. This is a debug cursor that enables iteration through the history of
+    // values for a given index entry.
+    WT_CURSOR* cursor = session.getNewCursor(_uri, "debug=(dump_version=true)");
+
+    const WiredTigerItem searchKey(keyString.getBuffer(), keyString.getSize());
+    cursor->set_key(cursor, searchKey.Get());
+
+    int ret = cursor->search(cursor);
+    while (ret != WT_NOTFOUND) {
+        invariantWTOK(ret, cursor->session);
+
+        uint64_t startTs = 0, startDurableTs = 0, stopTs = 0, stopDurableTs = 0;
+        uint64_t startTxnId = 0, stopTxnId = 0;
+        uint8_t flags = 0, location = 0, prepare = 0, type = 0;
+        WT_ITEM value;
+
+        invariantWTOK(cursor->get_value(cursor,
+                                        &startTxnId,
+                                        &startTs,
+                                        &startDurableTs,
+                                        &stopTxnId,
+                                        &stopTs,
+                                        &stopDurableTs,
+                                        &type,
+                                        &prepare,
+                                        &flags,
+                                        &location,
+                                        &value),
+                      cursor->session);
+
+        auto indexKey = KeyString::toBson(
+            keyString.getBuffer(), keyString.getSize(), _ordering, keyString.getTypeBits());
+
+        LOGV2(6601200,
+              "WiredTiger index entry metadata",
+              "keyString"_attr = keyString,
+              "indexKey"_attr = indexKey,
+              "startTxnId"_attr = startTxnId,
+              "startTs"_attr = Timestamp(startTs),
+              "startDurableTs"_attr = Timestamp(startDurableTs),
+              "stopTxnId"_attr = stopTxnId,
+              "stopTs"_attr = Timestamp(stopTs),
+              "stopDurableTs"_attr = Timestamp(stopDurableTs),
+              "type"_attr = type,
+              "prepare"_attr = prepare,
+              "flags"_attr = flags,
+              "location"_attr = location);
+
+        ret = cursor->next(cursor);
+    }
 }
 
 long long WiredTigerIndex::getSpaceUsedBytes(OperationContext* opCtx) const {
@@ -1192,16 +1270,12 @@ protected:
 
             LOGV2_TRACE_CURSOR(5683900, "cmp after advance: {cmp}", "cmp"_attr = cmp);
 
-            // We do not expect any exact matches or matches of prefixes by comparing keys of
-            // different lengths. Callers either seek using keys with discriminators that always
-            // compare unequally, or in the case of restoring a cursor, perform exact searches. In
-            // the case of an exact search, we will have returned earlier.
-            dassert(cmp);
-
             if (enforcingPrepareConflicts) {
                 // If we are enforcing prepare conflicts, calling next() or prev() must always give
                 // us a key that compares, respectively, greater than or less than our search key.
-                dassert(_forward ? cmp > 0 : cmp < 0);
+                // An exact match is also possible in the case of _id indexes, because the recordid
+                // is not a part of the key.
+                dassert(_forward ? cmp >= 0 : cmp <= 0);
             }
         }
 
