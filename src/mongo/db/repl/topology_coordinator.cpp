@@ -2407,37 +2407,46 @@ TopologyCoordinator::UnelectableReasonMask TopologyCoordinator::_getMyUnelectabl
     UnelectableReasonMask result = None;
     const OpTime lastApplied = getMyLastAppliedOpTime();
     if (lastApplied.isNull()) {
+        // INSTRUMENT_BB
         result |= NoData;
     }
     if (!_aMajoritySeemsToBeUp()) {
+        // INSTRUMENT_BB
         result |= CannotSeeMajority;
     }
     if (_selfIndex == -1) {
+        // INSTRUMENT_BB
         result |= NotInitialized;
         return result;
     }
     if (_selfConfig().isArbiter()) {
+        // INSTRUMENT_BB
         result |= ArbiterIAm;
     }
     if (_selfConfig().getPriority() <= 0) {
+        // INSTRUMENT_BB
         result |= NoPriority;
     }
     if (_stepDownUntil > now) {
+        // INSTRUMENT_BB
         result |= StepDownPeriodActive;
     }
 
     // Cannot be electable unless secondary or already primary
     if (!getMemberState().secondary() && !_iAmPrimary()) {
+        // INSTRUMENT_BB
         result |= NotSecondary;
     }
 
     if (reason == StartElectionReasonEnum::kPriorityTakeover &&
         !_amIFreshEnoughForPriorityTakeover()) {
+        // INSTRUMENT_BB
         result |= NotCloseEnoughToLatestForPriorityTakeover;
     }
 
     if (reason == StartElectionReasonEnum::kCatchupTakeover &&
         !_amIFreshEnoughForCatchupTakeover()) {
+        // INSTRUMENT_BB
         result |= NotFreshEnoughForCatchupTakeover;
     }
     return result;
@@ -2546,25 +2555,30 @@ void TopologyCoordinator::_setLeaderMode(TopologyCoordinator::LeaderMode newMode
     // Invariants for valid state transitions.
     switch (_leaderMode) {
         case LeaderMode::kNotLeader:
+            // INSTRUMENT_BB
             invariant(newMode == LeaderMode::kLeaderElect);
             break;
         case LeaderMode::kLeaderElect:
+            // INSTRUMENT_BB
             invariant(newMode == LeaderMode::kNotLeader ||  // TODO(SERVER-30852): remove this case
                       newMode == LeaderMode::kWritablePrimary ||
                       newMode == LeaderMode::kAttemptingStepDown ||
                       newMode == LeaderMode::kSteppingDown);
             break;
         case LeaderMode::kWritablePrimary:
+            // INSTRUMENT_BB
             invariant(newMode == LeaderMode::kNotLeader ||  // TODO(SERVER-30852): remove this case
                       newMode == LeaderMode::kAttemptingStepDown ||
                       newMode == LeaderMode::kSteppingDown);
             break;
         case LeaderMode::kAttemptingStepDown:
+            // INSTRUMENT_BB
             invariant(newMode == LeaderMode::kNotLeader ||
                       newMode == LeaderMode::kWritablePrimary ||
                       newMode == LeaderMode::kSteppingDown || newMode == LeaderMode::kLeaderElect);
             break;
         case LeaderMode::kSteppingDown:
+            // INSTRUMENT_BB
             invariant(newMode == LeaderMode::kNotLeader);
             break;
     }
@@ -2574,6 +2588,7 @@ void TopologyCoordinator::_setLeaderMode(TopologyCoordinator::LeaderMode newMode
 MemberState TopologyCoordinator::getMemberState() const {
     if (_selfIndex == -1) {
         if (_rsConfig.isInitialized()) {
+            // INSTRUMENT_BB
             return MemberState::RS_REMOVED;
         }
         return MemberState::RS_STARTUP;
@@ -2585,26 +2600,31 @@ MemberState TopologyCoordinator::getMemberState() const {
         } else {
             invariant(_storageEngineSupportsReadCommitted != ReadCommittedSupport::kUnknown);
             if (_storageEngineSupportsReadCommitted == ReadCommittedSupport::kNo) {
+                // INSTRUMENT_BB
                 return MemberState::RS_REMOVED;
             }
         }
     } else {
         if (_options.clusterRole == ClusterRole::ConfigServer && !skipShardingConfigurationChecks) {
+            // INSTRUMENT_BB
             return MemberState::RS_REMOVED;
         }
     }
 
     if (_role == Role::kLeader) {
+        // INSTRUMENT_BB
         invariant(_currentPrimaryIndex == _selfIndex);
         invariant(_leaderMode != LeaderMode::kNotLeader);
         return MemberState::RS_PRIMARY;
     }
     const MemberConfig& myConfig = _selfConfig();
     if (myConfig.isArbiter()) {
+        // INSTRUMENT_BB
         return MemberState::RS_ARBITER;
     }
     if (((_maintenanceModeCalls > 0) || (_hasOnlyAuthErrorUpHeartbeats(_memberData, _selfIndex))) &&
         (_followerMode == MemberState::RS_SECONDARY)) {
+        // INSTRUMENT_BB
         return MemberState::RS_RECOVERING;
     }
     return _followerMode;
@@ -2820,6 +2840,7 @@ void TopologyCoordinator::finishUnconditionalStepDown() {
     _stepDownSelfAndReplaceWith(remotePrimaryIndex);
 }
 
+// INSTRUMENT_FUNC
 void TopologyCoordinator::_stepDownSelfAndReplaceWith(int newPrimary) {
     invariant(_role == Role::kLeader);
     invariant(_selfIndex != -1);
@@ -2959,15 +2980,18 @@ OpTimeAndWallTime TopologyCoordinator::getLastCommittedOpTimeAndWallTime() const
 bool TopologyCoordinator::canCompleteTransitionToPrimary(long long termWhenDrainCompleted) const {
 
     if (termWhenDrainCompleted != _term) {
+        // INSTRUMENT_BB
         return false;
     }
     // Allow completing the transition to primary even when in the middle of a stepdown attempt,
     // in case the stepdown attempt fails.
     if (_leaderMode != LeaderMode::kLeaderElect && _leaderMode != LeaderMode::kAttemptingStepDown &&
         _leaderMode != LeaderMode::kSteppingDown) {
+        // INSTRUMENT_BB
         return false;
     }
 
+    // INSTRUMENT_BB
     return true;
 }
 
@@ -2998,6 +3022,7 @@ int TopologyCoordinator::getMaintenanceCount() const {
 
 TopologyCoordinator::UpdateTermResult TopologyCoordinator::updateTerm(long long term, Date_t now) {
     if (term <= _term) {
+        // INSTRUMENT_BB
         return TopologyCoordinator::UpdateTermResult::kAlreadyUpToDate;
     }
     // Don't run election if we just stood up or learned about a new term.
@@ -3006,6 +3031,7 @@ TopologyCoordinator::UpdateTermResult TopologyCoordinator::updateTerm(long long 
     // Don't update the term just yet if we are going to step down, as we don't want to report
     // that we are primary in the new term.
     if (_iAmPrimary()) {
+        // INSTRUMENT_BB
         return TopologyCoordinator::UpdateTermResult::kTriggerStepDown;
     }
     LOGV2_DEBUG(21827,
@@ -3015,6 +3041,7 @@ TopologyCoordinator::UpdateTermResult TopologyCoordinator::updateTerm(long long 
                 "oldTerm"_attr = _term,
                 "newTerm"_attr = term);
     _term = term;
+    // INSTRUMENT_BB
     return TopologyCoordinator::UpdateTermResult::kUpdatedTerm;
 }
 

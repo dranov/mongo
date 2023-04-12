@@ -188,12 +188,16 @@ bool VoteRequester::Algorithm::hasReceivedSufficientResponses() const {
 
 VoteRequester::Result VoteRequester::Algorithm::getResult() const {
     if (_staleTerm) {
+        // INSTRUMENT_BB
         return Result::kStaleTerm;
     } else if (_primaryHost && _primaryVote != PrimaryVote::Yes) {
+        // INSTRUMENT_BB
         return Result::kPrimaryRespondedNo;
     } else if (_votes >= _rsConfig.getMajorityVoteCount()) {
+        // INSTRUMENT_BB
         return Result::kSuccessfullyElected;
     } else {
+        // INSTRUMENT_BB
         return Result::kInsufficientVotes;
     }
 }

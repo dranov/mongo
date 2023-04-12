@@ -350,7 +350,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                 //        }
                 //     ...
                 // }
-
+                // INSTRUMENT_BB
                 fixUpInfo.collectionsToDrop.insert(*uuid);
                 return Status::OK();
             }
@@ -367,6 +367,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                 //        }
                 //     ...
                 // }
+                // INSTRUMENT_BB
                 NamespaceString collectionNamespace(nss.getSisterNS(first.valueStringDataSafe()));
 
                 // Registers the collection to be removed from the drop pending collection
@@ -387,7 +388,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                 //            name: "x_1",
                 //            ns: "foo.x"
                 //        }
-
+                // INSTRUMENT_BB
                 string ns = nss.db().toString() + '.' + first.str();
 
                 string indexName;
@@ -429,7 +430,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                 //       key: { x: 1 },
                 //       name: "x_1",
                 //   }
-
+                // INSTRUMENT_BB
                 string indexName;
                 auto status = bsonExtractStringField(obj, "name", &indexName);
                 if (!status.isOK()) {
@@ -464,6 +465,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                 return Status::OK();
             }
             case OplogEntry::CommandType::kStartIndexBuild: {
+                // INSTRUMENT_BB
                 auto swIndexBuildOplogEntry = IndexBuildOplogEntry::parse(oplogEntry);
                 if (!swIndexBuildOplogEntry.isOK()) {
                     return {ErrorCodes::UnrecoverableRollbackError,
@@ -514,6 +516,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                 return Status::OK();
             }
             case OplogEntry::CommandType::kAbortIndexBuild: {
+                // INSTRUMENT_BB
                 auto swIndexBuildOplogEntry = IndexBuildOplogEntry::parse(oplogEntry);
                 if (!swIndexBuildOplogEntry.isOK()) {
                     return {ErrorCodes::UnrecoverableRollbackError,
@@ -547,6 +550,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                 return Status::OK();
             }
             case OplogEntry::CommandType::kCommitIndexBuild: {
+                // INSTRUMENT_BB
                 auto swIndexBuildOplogEntry = IndexBuildOplogEntry::parse(oplogEntry);
                 if (!swIndexBuildOplogEntry.isOK()) {
                     return {ErrorCodes::UnrecoverableRollbackError,
@@ -604,7 +608,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
 
                 // dropTarget will be false if no collection is dropped during the rename.
                 // The ui field will contain the UUID of the new collection that is created.
-
+                // INSTRUMENT_BB
                 BSONObj cmd = obj;
 
                 std::string ns = first.str();
@@ -663,6 +667,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                 // Since we wait for all internal collection drops to be committed before recording
                 // a 'dropDatabase' oplog entry, this will always create an empty database.
                 // Creating an empty database doesn't mean anything, so we do nothing.
+                // INSTRUMENT_BB
                 return Status::OK();
             }
             case OplogEntry::CommandType::kCollMod: {
@@ -676,7 +681,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                     //                  expireAfterSeconds: 600
                     //              }
                     //    }
-
+                    // INSTRUMENT_BB
                     const auto modification = field.fieldNameStringData();
                     if (modification == "collMod") {
                         continue;  // Skips the command name. The first field in the obj will be the
@@ -717,6 +722,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                 // Additionally, for transactions, applyOps entries may be linked by their
                 // previousTransactionOpTimes.  For those, we need to walk the chain and get to
                 // all the entries.  We don't worry about the order that we walk the entries.
+                // INSTRUMENT_BB
                 auto operations = first;
                 auto prevWriteOpTime = oplogEntry.getPrevWriteOpTimeInTransaction();
                 auto txnHistoryIter = prevWriteOpTime
@@ -767,6 +773,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                 return Status::OK();
             }
             case OplogEntry::CommandType::kAbortTransaction: {
+                // INSTRUMENT_BB
                 return Status::OK();
             }
             default: {

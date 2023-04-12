@@ -415,12 +415,14 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
         switch (oplogEntry.getCommandType()) {
             case OplogEntry::CommandType::kRenameCollection: {
                 // Add both the 'from' and 'to' namespaces.
+                // INSTRUMENT_BB
                 namespaces.insert(NamespaceString(firstElem.valueStringDataSafe()));
                 namespaces.insert(NamespaceString(obj.getStringField("to")));
                 break;
             }
             case OplogEntry::CommandType::kDropDatabase: {
                 // There is no specific namespace to save for a drop database operation.
+                // INSTRUMENT_BB
                 break;
             }
             case OplogEntry::CommandType::kDbCheck:
@@ -428,6 +430,7 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
                 // These commands do not need to be supported by rollback. 'convertToCapped' should
                 // always be converted to lower level DDL operations, and 'emptycapped' is a
                 // testing-only command.
+                // INSTRUMENT_BB
                 std::string message = str::stream()
                     << "Encountered unsupported command type '" << firstElem.fieldName()
                     << "' during rollback.";
@@ -444,6 +447,7 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
             case OplogEntry::CommandType::kCollMod: {
                 // For all other command types, we should be able to parse the collection name from
                 // the first command argument.
+                // INSTRUMENT_BB
                 try {
                     auto cmdNss = CommandHelpers::parseNsCollectionRequired(opNss.db(), obj);
                     namespaces.insert(cmdNss);

@@ -1879,10 +1879,13 @@ bool ReplicationCoordinatorImpl::isCommitQuorumSatisfied(
 
     StringData patternName;
     if (commitQuorum.mode == CommitQuorumOptions::kMajority) {
+        // INSTRUMENT_BB
         patternName = ReplSetConfig::kMajorityWriteConcernModeName;
     } else if (commitQuorum.mode == CommitQuorumOptions::kVotingMembers) {
+        // INSTRUMENT_BB
         patternName = ReplSetConfig::kVotingMembersWriteConcernModeName;
     } else {
+        // INSTRUMENT_BB
         patternName = commitQuorum.mode;
     }
 
@@ -2201,15 +2204,19 @@ void ReplicationCoordinatorImpl::updateAndLogStateTransitionMetrics(
 
     switch (stateTransition) {
         case ReplicationCoordinator::OpsKillingStateTransitionEnum::kStepUp:
+            // INSTRUMENT_BB
             lastStateTransition = "stepUp";
             break;
         case ReplicationCoordinator::OpsKillingStateTransitionEnum::kStepDown:
+            // INSTRUMENT_BB
             lastStateTransition = "stepDown";
             break;
         case ReplicationCoordinator::OpsKillingStateTransitionEnum::kRollback:
+            // INSTRUMENT_BB
             lastStateTransition = "rollback";
             break;
         default:
+            // INSTRUMENT_BB
             MONGO_UNREACHABLE;
     }
 
@@ -2703,6 +2710,7 @@ const OperationContext* ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown
     return _opCtx;
 }
 
+// INSTRUMENT_FUNC
 void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
                                           const bool force,
                                           const Milliseconds& waitTime,
@@ -4344,22 +4352,31 @@ void ReplicationCoordinatorImpl::_setConfigState_inlock(ConfigState newState) {
 std::string ReplicationCoordinatorImpl::getConfigStateString(ConfigState state) {
     switch (state) {
         case kConfigPreStart:
+            // INSTRUMENT_BB
             return "ConfigPreStart";
         case kConfigStartingUp:
+            // INSTRUMENT_BB
             return "ConfigStartingUp";
         case kConfigReplicationDisabled:
+            // INSTRUMENT_BB
             return "ConfigReplicationDisabled";
         case kConfigUninitialized:
+            // INSTRUMENT_BB
             return "ConfigUninitialized";
         case kConfigSteady:
+            // INSTRUMENT_BB
             return "ConfigSteady";
         case kConfigInitiating:
+            // INSTRUMENT_BB
             return "ConfigInitiating";
         case kConfigReconfiguring:
+            // INSTRUMENT_BB
             return "ConfigReconfiguring";
         case kConfigHBReconfiguring:
+            // INSTRUMENT_BB
             return "ConfigHBReconfiguring";
         default:
+            // INSTRUMENT_BB
             MONGO_UNREACHABLE;
     }
 }
@@ -4584,21 +4601,27 @@ void ReplicationCoordinatorImpl::_performPostMemberStateUpdateAction(
     PostMemberStateUpdateAction action) {
     switch (action) {
         case kActionNone:
+            // INSTRUMENT_BB
             break;
         case kActionFollowerModeStateChange:
+            // INSTRUMENT_BB
             _onFollowerModeStateChange();
             break;
         case kActionRollbackOrRemoved:
+            // INSTRUMENT_BB
             _externalState->closeConnections();
         /* FALLTHROUGH */
         case kActionSteppedDown:
+            // INSTRUMENT_BB
             _externalState->onStepDownHook();
             ReplicaSetAwareServiceRegistry::get(_service).onStepDown();
             break;
         case kActionStartSingleNodeElection:
+            // INSTRUMENT_BB
             _startElectSelfIfEligibleV1(StartElectionReasonEnum::kElectionTimeout);
             break;
         default:
+            // INSTRUMENT_BB
             LOGV2_FATAL(26010,
                         "Unknown post member state update action {action}",
                         "Unknown post member state update action",
@@ -5268,6 +5291,7 @@ ChangeSyncSourceAction ReplicationCoordinatorImpl::shouldChangeSyncSource(
 
     if (_topCoord->shouldChangeSyncSource(
             currentSource, replMetadata, oqMetadata, lastOpTimeFetched, now)) {
+        // INSTRUMENT_BB
         return ChangeSyncSourceAction::kStopSyncingAndEnqueueLastBatch;
     }
 
@@ -5277,9 +5301,11 @@ ChangeSyncSourceAction ReplicationCoordinatorImpl::shouldChangeSyncSource(
         // We should drop the last batch if we find a significantly closer node. This is to
         // avoid advancing our 'lastFetched', which makes it more likely that we will be able to
         // choose the closer node as our sync source.
+        // INSTRUMENT_BB
         return ChangeSyncSourceAction::kStopSyncingAndDropLastBatchIfPresent;
     }
 
+    // INSTRUMENT_BB
     return ChangeSyncSourceAction::kContinueSyncing;
 }
 
@@ -5289,15 +5315,18 @@ ChangeSyncSourceAction ReplicationCoordinatorImpl::shouldChangeSyncSourceOnError
     const auto now = _replExecutor->now();
 
     if (_topCoord->shouldChangeSyncSourceOnError(currentSource, lastOpTimeFetched, now)) {
+        // INSTRUMENT_BB
         return ChangeSyncSourceAction::kStopSyncingAndDropLastBatchIfPresent;
     }
 
     const auto readPreference = _getSyncSourceReadPreference(lock);
     if (_topCoord->shouldChangeSyncSourceDueToPingTime(
             currentSource, _getMemberState_inlock(), lastOpTimeFetched, now, readPreference)) {
+        // INSTRUMENT_BB
         return ChangeSyncSourceAction::kStopSyncingAndDropLastBatchIfPresent;
     }
 
+    // INSTRUMENT_BB
     return ChangeSyncSourceAction::kContinueSyncing;
 }
 
@@ -5775,6 +5804,7 @@ Status ReplicationCoordinatorImpl::processHeartbeatV1(const ReplSetHeartbeatArgs
         // back to any node that sends us a heartbeat, in case one of those remote nodes has
         // a configuration that contains us.  Chances are excellent that it will, since that
         // is the only reason for a remote node to send this node a heartbeat request.
+        // INSTRUMENT_BB
         if (!senderHost.empty() && _seedList.insert(senderHost).second) {
             LOGV2(21400,
                   "Scheduling heartbeat to fetch a new config from: {senderHost} since we are not "
@@ -5787,6 +5817,7 @@ Status ReplicationCoordinatorImpl::processHeartbeatV1(const ReplSetHeartbeatArgs
         }
     } else if (result.isOK() &&
                response->getConfigVersionAndTerm() < args.getConfigVersionAndTerm()) {
+        // INSTRUMENT_BB
         logv2::DynamicAttributes attr;
         attr.add("configTerm", args.getConfigTerm());
         attr.add("configVersion", args.getConfigVersion());
@@ -5825,6 +5856,7 @@ Status ReplicationCoordinatorImpl::processHeartbeatV1(const ReplSetHeartbeatArgs
         // new round of heartbeats, whose responses should inform us of the new primary. We only do
         // this if the term of the heartbeat is greater than or equal to our own, to prevent
         // updating our view to a stale primary.
+        // INSTRUMENT_BB
         if (args.hasSender() && args.getSenderId() == args.getPrimaryId() &&
             args.getTerm() >= _topCoord->getTerm()) {
             std::string myPrimaryId =
@@ -5896,6 +5928,7 @@ EventHandle ReplicationCoordinatorImpl::_updateTerm_inlock(
     if (localUpdateTermResult == TopologyCoordinator::UpdateTermResult::kUpdatedTerm) {
         // When the node discovers a new term, the new term date metrics are now out-of-date, so we
         // clear them.
+        // INSTRUMENT_BB
         ReplicationMetrics::get(getServiceContext()).clearParticipantNewTermDates();
 
         _termShadow.store(term);
@@ -5908,6 +5941,7 @@ EventHandle ReplicationCoordinatorImpl::_updateTerm_inlock(
     }
 
     if (localUpdateTermResult == TopologyCoordinator::UpdateTermResult::kTriggerStepDown) {
+        // INSTRUMENT_BB
         if (!_pendingTermUpdateDuringStepDown || *_pendingTermUpdateDuringStepDown < term) {
             _pendingTermUpdateDuringStepDown = term;
         }
@@ -5928,6 +5962,7 @@ EventHandle ReplicationCoordinatorImpl::_updateTerm_inlock(
     return EventHandle();
 }
 
+// INSTRUMENT_FUNC
 void ReplicationCoordinatorImpl::waitUntilSnapshotCommitted(OperationContext* opCtx,
                                                             const Timestamp& untilSnapshot) {
     stdx::unique_lock<Latch> lock(_mutex);
@@ -5974,12 +6009,14 @@ void ReplicationCoordinatorImpl::createWMajorityWriteAvailabilityDateWaiter(OpTi
 bool ReplicationCoordinatorImpl::_updateCommittedSnapshot(WithLock lk,
                                                           const OpTime& newCommittedSnapshot) {
     if (gTestingSnapshotBehaviorInIsolation) {
+        // INSTRUMENT_BB
         return false;
     }
 
     // If we are in ROLLBACK state, do not set any new _currentCommittedSnapshot, as it will be
     // cleared at the end of rollback anyway.
     if (_memberState.rollback()) {
+        // INSTRUMENT_BB
         LOGV2(21404, "Not updating committed snapshot because we are in rollback");
         return false;
     }
@@ -6006,6 +6043,7 @@ bool ReplicationCoordinatorImpl::_updateCommittedSnapshot(WithLock lk,
     if (_externalState->snapshotsEnabled() && _currentCommittedSnapshot) {
         _wakeReadyWaiters(lk, _currentCommittedSnapshot);
     }
+    // INSTRUMENT_BB
     return true;
 }
 

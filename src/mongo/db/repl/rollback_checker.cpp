@@ -51,10 +51,12 @@ StatusWith<RollbackChecker::CallbackHandle> RollbackChecker::checkForRollback(
     const CallbackFn& nextAction) {
     return _scheduleGetRollbackId([this, nextAction](const RemoteCommandCallbackArgs& args) {
         if (!args.response.isOK()) {
+            // INSTRUMENT_BB
             nextAction(args.response.status);
             return;
         }
         if (auto rbidElement = args.response.data["rbid"]) {
+            // INSTRUMENT_BB
             int remoteRBID = rbidElement.numberInt();
 
             UniqueLock lk(_mutex);
@@ -62,6 +64,7 @@ StatusWith<RollbackChecker::CallbackHandle> RollbackChecker::checkForRollback(
             lk.unlock();
             nextAction(hadRollback);
         } else {
+            // INSTRUMENT_BB
             nextAction(Status(ErrorCodes::CommandFailed,
                               "replSetGetRBID command failed when checking for rollback"));
         }
